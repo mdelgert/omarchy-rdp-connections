@@ -9,9 +9,11 @@
 # script's stdin. See README.md.
 #
 # Security model: server, username and password live only in the Secret
-# Service keyring. The JSON index on disk holds nothing but an opaque id and
-# a display name, and no secret is ever passed as a command-line argument,
-# written to a temp file, echoed to a log, or included in a notification.
+# Service keyring. The JSON index on disk holds nothing but opaque ids — a
+# connection is labelled by its server, and that label is read back out of the
+# keyring at display time rather than cached on disk. No secret is ever passed
+# as a command-line argument, written to a temp file, echoed to a log, or
+# included in a notification.
 
 set -euo pipefail
 umask 077
@@ -22,12 +24,13 @@ INDEX_FILE="$STATE_DIR/connections.json"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Glyphs are taken from the set Omarchy's own menu already renders, so they
-# resolve in whatever Nerd Font the menu is configured with.
-GLYPH_CONNECT="󱓞"
-GLYPH_NEW="󰉉"
-GLYPH_EDIT=""
-GLYPH_REMOVE="󰭌"
-GLYPH_HOST=""
+# resolve in whatever Nerd Font the menu is configured with. Written as escapes
+# rather than literal characters so they survive copying and editing intact.
+GLYPH_CONNECT=$'\U000F14DE'  # trigger
+GLYPH_NEW=$'\U000F0249'      # install
+GLYPH_EDIT=$'\uE615'         # setup
+GLYPH_REMOVE=$'\U000F0B4C'   # remove
+GLYPH_HOST=$'\U000F0379'     # monitor
 
 # stdin is the channel back to the bar widget. Stash it on fd 3 and take
 # stdin away from everything else, so no helper can swallow the answer.
@@ -98,21 +101,41 @@ new_id() {
   printf 'conn-%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 }
 
-name_for_id() {
-  jq -r --arg id "$1" 'first(.connections[] | select(.id == $id) | .name) // ""' "$INDEX_FILE"
+# A connection is identified in the UI by its server. Two connections may
+# legitimately point at the same host, so a repeat gets a counter appended for
+# display only — enough to tell the rows apart and to map a choice back to one
+# id, without inventing a second name the user has to maintain.
+#
+# Fills the caller's LABELS and IDS arrays, in index order.
+build_labels() {
+  local id server label
+  declare -A seen=()
+  LABELS=()
+  IDS=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    server="$(secret_get "$id" server)"
+    [[ -n "$server" ]] || server="(unavailable — keyring locked?)"
+    if [[ -n "${seen[$server]:-}" ]]; then
+      seen["$server"]=$(( seen["$server"] + 1 ))
+      label="$server (${seen[$server]})"
+    else
+      seen["$server"]=1
+      label="$server"
+    fi
+    LABELS+=("$label")
+    IDS+=("$id")
+  done < <(jq -r '.connections[].id' "$INDEX_FILE")
 }
 
-# Display names double as the picker's selection key, so they have to be
-# unique. Rather than rejecting a duplicate and losing what was typed, suffix
-# it the way a file manager would.
-unique_name() {
-  local base="$1" exclude="${2-}" candidate="$1" n=2
-  while jq -e --arg n "$candidate" --arg x "$exclude" \
-      'any(.connections[]; .name == $n and .id != $x)' "$INDEX_FILE" >/dev/null 2>&1; do
-    candidate="$base ($n)"
-    n=$((n + 1))
+label_for_id() {
+  local id="$1" i
+  local -a LABELS=() IDS=()
+  build_labels
+  for i in "${!IDS[@]}"; do
+    [[ "${IDS[$i]}" == "$id" ]] && { printf '%s' "${LABELS[$i]}"; return 0; }
   done
-  printf '%s' "$candidate"
+  printf '%s' "a connection"
 }
 
 # ------------------------------------------------------------------ secrets
@@ -191,46 +214,53 @@ sanitize() {
 }
 
 choose_id() {
-  local -a names=()
-  local name id
-  mapfile -t names < <(jq -r --arg g "$GLYPH_HOST" '.connections[] | "\($g)\t\(.name)"' "$INDEX_FILE")
-  (( ${#names[@]} > 0 )) || {
+  local -a LABELS=() IDS=() options=()
+  local chosen i
+  build_labels
+  (( ${#IDS[@]} > 0 )) || {
     notify "No saved connections yet — choose “New connection” first."
     return 1
   }
-  name="$(pick "$1" "${names[@]}")" || return 1
-  id="$(jq -r --arg n "$name" 'first(.connections[] | select(.name == $n) | .id) // ""' "$INDEX_FILE")"
-  [[ -n "$id" ]] || return 1
-  printf '%s' "$id"
+  for i in "${!LABELS[@]}"; do
+    options+=("$GLYPH_HOST"$'\t'"${LABELS[$i]}")
+  done
+  chosen="$(pick "$1" "${options[@]}")" || return 1
+  for i in "${!LABELS[@]}"; do
+    [[ "${LABELS[$i]}" == "$chosen" ]] && { printf '%s' "${IDS[$i]}"; return 0; }
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------ actions
 
+# Every prompt is read into `raw` first: the helpers exit non-zero when the
+# user presses Escape, and that status is only visible on the assignment
+# itself — wrapping the prompt in sanitize() would swallow it and turn a
+# cancel into an empty string.
+#
+# Notifications never name the server. The user is looking at the screen when
+# they act; a notification outlives the moment and can sit in a shared history.
+
 new_connection() {
-  local raw name server username password id
-  raw="$(ask 'Connection name')" || return 0
-  name="$(sanitize "$raw")"
-  [[ -n "$name" ]] || return 0
+  local raw server username password id
   raw="$(ask 'Server (host or host:port)')" || return 0
   server="$(sanitize "$raw")"
-  [[ -n "$server" ]] || { notify "Server is required — nothing saved."; return 0; }
+  [[ -n "$server" ]] || return 0
   raw="$(ask 'Username (user or DOMAIN\user)')" || return 0
   username="$(sanitize "$raw")"
   [[ -n "$username" ]] || { notify "Username is required — nothing saved."; return 0; }
 
-  name="$(unique_name "$name")"
-  ask_secret "Password for $name" || { notify "Cancelled — nothing saved."; return 0; }
+  ask_secret "Password for $server" || { notify "Cancelled — nothing saved."; return 0; }
   password="$(sanitize "$SECRET_REPLY")"
   SECRET_REPLY=""
   [[ -n "$password" ]] || { notify "Password is required — nothing saved."; return 0; }
 
   id="$(new_id)"
-  secret_set "$id" "$name" server "$server" || die "Could not write to the keyring."
-  secret_set "$id" "$name" username "$username" || die "Could not write to the keyring."
-  secret_set "$id" "$name" password "$password" || die "Could not write to the keyring."
-  jq --arg id "$id" --arg name "$name" \
-    '.connections += [{id: $id, name: $name}]' "$INDEX_FILE" | write_index
-  notify "Saved “$name”."
+  secret_set "$id" "$server" server "$server" || die "Could not write to the keyring."
+  secret_set "$id" "$server" username "$username" || die "Could not write to the keyring."
+  secret_set "$id" "$server" password "$password" || die "Could not write to the keyring."
+  jq --arg id "$id" '.connections += [{id: $id}]' "$INDEX_FILE" | write_index
+  notify "Connection saved."
 }
 
 # One field at a time. omarchy-menu-input cannot prefill, and putting the
@@ -238,49 +268,40 @@ new_connection() {
 # world-readable /proc/<pid>/cmdline, so the menu asks what to change instead
 # of walking every field on every edit.
 edit_connection() {
-  local id name field raw value
+  local id label field raw value
   id="$(choose_id 'Edit')" || return 0
 
   while true; do
-    name="$(name_for_id "$id")"
-    [[ -n "$name" ]] || return 0
-    field="$(pick "Edit $name" \
-      "$GLYPH_EDIT	Name" \
+    label="$(label_for_id "$id")"
+    field="$(pick "Edit $label" \
       "$GLYPH_HOST	Server" \
       "$GLYPH_EDIT	Username" \
       "$GLYPH_EDIT	Password")" || return 0
 
     case "$field" in
-      Name)
-        raw="$(ask 'New connection name')" || continue
-        value="$(sanitize "$raw")"
-        [[ -n "$value" ]] || continue
-        value="$(unique_name "$value" "$id")"
-        jq --arg id "$id" --arg name "$value" \
-          '.connections |= map(if .id == $id then .name = $name else . end)' "$INDEX_FILE" | write_index
-        notify "Renamed to “$value”."
-        ;;
       Server)
         raw="$(ask 'New server (host or host:port)')" || continue
         value="$(sanitize "$raw")"
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$name" server "$value" || die "Could not write to the keyring."
-        notify "Updated the server for “$name”."
+        secret_set "$id" "$value" server "$value" || die "Could not write to the keyring."
+        notify "Server updated."
         ;;
       Username)
         raw="$(ask 'New username (user or DOMAIN\user)')" || continue
         value="$(sanitize "$raw")"
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$name" username "$value" || die "Could not write to the keyring."
-        notify "Updated the username for “$name”."
+        secret_set "$id" "$(secret_get "$id" server)" username "$value" \
+          || die "Could not write to the keyring."
+        notify "Username updated."
         ;;
       Password)
-        ask_secret "New password for $name" || continue
+        ask_secret "New password for $label" || continue
         value="$(sanitize "$SECRET_REPLY")"
         SECRET_REPLY=""
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$name" password "$value" || die "Could not write to the keyring."
-        notify "Updated the password for “$name”."
+        secret_set "$id" "$(secret_get "$id" server)" password "$value" \
+          || die "Could not write to the keyring."
+        notify "Password updated."
         ;;
       *) return 0 ;;
     esac
@@ -288,17 +309,17 @@ edit_connection() {
 }
 
 remove_connection() {
-  local id name answer
+  local id label answer
   id="$(choose_id 'Remove')" || return 0
-  name="$(name_for_id "$id")"
-  answer="$(pick "Remove $name?" 'Cancel' "$GLYPH_REMOVE	Remove $name")" || return 0
-  [[ "$answer" == "Remove $name" ]] || return 0
+  label="$(label_for_id "$id")"
+  answer="$(pick "Remove $label?" 'Cancel' "$GLYPH_REMOVE	Remove $label")" || return 0
+  [[ "$answer" == "Remove $label" ]] || return 0
 
   # Drop the index entry first: an entry with no keyring items is a visible,
   # repairable state, whereas orphaned keyring items are invisible.
   jq --arg id "$id" '.connections |= map(select(.id != $id))' "$INDEX_FILE" | write_index
   secret_forget "$id"
-  notify "Removed “$name”."
+  notify "Connection removed."
 }
 
 # Detached on purpose: the RDP session has to outlive both this menu and a

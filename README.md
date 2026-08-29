@@ -5,8 +5,9 @@ launching RDP connections through `sdl-freerdp3`, with working Hyprland
 multi-monitor fullscreen.
 
 Click **RDP** in the bar and Omarchy's own menu offers **Connect**, **New
-connection**, **Edit connection**, and **Remove connection**. After installing
-the plugin, it needs no terminal commands.
+connection**, **Edit connection**, and **Remove connection**. Adding one asks
+for a server, a username, and a password — nothing else. After installing the
+plugin, it needs no terminal commands.
 
 - Plugin ID: `io.github.mdelgert.rdp-connections`
 - Kind: `bar-widget`
@@ -110,25 +111,31 @@ Inspect them yourself:
 secret-tool search --all application io.github.mdelgert.omarchy-rdp
 ```
 
-The only thing written to disk is an index of display names and opaque ids at
+The only thing written to disk is a list of opaque ids at
 `${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections/connections.json`
 (mode `600`, in a `700` directory):
 
 ```json
-{ "connections": [ { "id": "conn-9f3a…", "name": "Work desktop" } ] }
+{ "connections": [ { "id": "conn-9f3a…" } ] }
 ```
 
-No host, username, or password is written to that file, to a temp file, to a
-log, or into a desktop notification — notifications name a connection only by
-its display name. Values are passed to `secret-tool` on **stdin**, never as
-arguments.
+A connection is labelled by its server, and that label is read back out of the
+keyring when the menu is drawn rather than cached in the file — so the hostname
+never lands on disk. No host, username, or password is written to that file, to
+a temp file, to a log, or into a desktop notification: notifications say
+"Connection saved" rather than naming the host, because a notification outlives
+the moment and can sit in a shared history. Values are passed to `secret-tool`
+on **stdin**, never as arguments.
 
-Editing changes one field at a time rather than walking every field, because
+Editing changes one field at a time — **Server**, **Username**, or **Password**
+— rather than walking every field, because
 `omarchy-menu-input` cannot prefill: showing you the current host or username
 would mean putting it in the helper's world-readable `/proc/<pid>/cmdline`.
 
-Display names are kept unique (a duplicate gets a ` (2)` suffix) so the picker
-always maps a chosen name back to exactly one connection.
+Two connections may legitimately point at the same host. A repeat gets a counter
+appended for display only — `d1`, `d1 (2)` — which is enough to tell the rows
+apart and to map a choice back to exactly one id, without a second name to
+maintain.
 
 Only one manager runs at a time, enforced with `flock` on
 `.menu.lock` in the state directory. The bar instantiates the widget once per
