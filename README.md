@@ -12,6 +12,51 @@ plugin, it needs no terminal commands.
 - Plugin ID: `io.github.mdelgert.rdp-connections`
 - Kind: `bar-widget`
 
+## Screenshots
+
+The **RDP** button lives in the bar's right section:
+
+![The RDP button in the Omarchy bar](docs/images/bar-button.png)
+
+Clicking it — or pressing the [keyboard shortcut](#keyboard-shortcut) —
+opens Omarchy's own menu card in the middle of the screen:
+
+![The main menu: Connect, New connection, Edit connection, Remove connection](docs/images/menu.png)
+
+**New connection** asks three questions and nothing else. Server and username
+go through `omarchy-menu-input`:
+
+| | |
+| :---: | :---: |
+| ![The server prompt](docs/images/new-server.png) | ![The username prompt](docs/images/new-username.png) |
+| Server | Username |
+
+The password is a masked field of the plugin's own, because that helper
+renders what you type in the clear:
+
+![The masked password prompt](docs/images/new-password.png)
+
+Saving reports success without naming the host, for the reason given under
+[Security model](#security-model):
+
+![The menu after saving, with a "Connection saved" notification](docs/images/saved.png)
+
+**Connect** and **Edit connection** start from the same list, labelled by
+server. Editing then changes one field at a time:
+
+| | |
+| :---: | :---: |
+| ![The Connect list, labelled by server](docs/images/connect.png) | ![Choosing which field to edit](docs/images/edit.png) |
+| Connect | Edit |
+
+**Remove connection** asks before it deletes, and the confirmation opens on
+**Cancel**:
+
+![The remove confirmation, defaulting to Cancel](docs/images/remove.png)
+
+The hosts in these shots — `win11-lab.local`, `dev-vm.local`, `srv-2022.lab` —
+are made up for the documentation.
+
 ## Dependencies
 
 **None to install.** The plugin uses only what an Omarchy machine already has:
@@ -89,7 +134,8 @@ full-screen overlay with the card centred and exclusive keyboard focus — rathe
 than as a bar panel hanging off the **RDP** button. The three prompts before it
 are Omarchy's menu card in the middle of the screen, so a panel pinned to the
 corner would move the flow out from under you halfway through. Clicking off the
-card refocuses it rather than dismissing; Escape cancels.
+card refocuses it rather than dismissing; Escape cancels. It is the masked
+prompt shown under [Screenshots](#screenshots).
 
 Run straight from a terminal there is no widget on the other end of the pipe,
 so the script falls back to a silent `read -rs` and stays directly testable.
