@@ -53,6 +53,17 @@ BarWidget {
 
   onBarChanged: injectPanel()
 
+  // Lets a Hyprland keybinding open the manager without going to the bar:
+  //   omarchy-shell io.github.mdelgert.rdp-connections open
+  // A bar surface exists per monitor, so this registers once per screen and
+  // the shell uses the first — which is what is wanted here, since the point
+  // is to open one menu, not one per display.
+  IpcHandler {
+    target: "io.github.mdelgert.rdp-connections"
+
+    function open(): void { root.openMenu() }
+  }
+
   Process {
     id: menu
     command: [root.menuPath]
