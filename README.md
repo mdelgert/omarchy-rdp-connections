@@ -299,31 +299,25 @@ creatable`. Omarchy's own polkit agent and panels report exactly the same ones.
 
 The shell only ever reads `~/.config/omarchy/plugins/<id>/`, never your
 checkout, so editing `BarWidget.qml` or `Panel.qml` here does nothing on its
-own. Install and reload in one step:
+own. Copy the changed files over and restart the shell:
 
 ```sh
-scripts/dev-install            # copy + restart the shell
-scripts/dev-install --enable   # ...and add it to the bar if it is not there
-scripts/dev-install --no-restart
-
-scripts/dev-uninstall          # take it off the bar, delete the installed copy, reload
-scripts/dev-uninstall --yes    # skip the confirmation prompt
+plugin_dir="$HOME/.config/omarchy/plugins/io.github.mdelgert.rdp-connections"
+omarchy plugin validate .            # check the working tree first
+cp manifest.json *.qml "$plugin_dir"
+cp scripts/* "$plugin_dir/scripts"
+omarchy-restart-shell
 ```
 
-`dev-uninstall` is the counterpart, for testing a clean-slate install: it
-disables the plugin, deletes `~/.config/omarchy/plugins/<id>/`, and restarts the
-shell. Your checkout is never touched. It refuses to delete a directory whose
-`manifest.json` carries a different id, and refuses outright if it finds a
-`.git` inside (that would be a real clone, not a dev install — use
-`omarchy plugin remove` for those, which keeps a backup). State outside the
-plugin directory, such as saved credentials, is deliberately left alone.
+To test a clean-slate install, remove the plugin and install it again from
+[From a local clone](#from-a-local-clone):
 
-It reads the id from `manifest.json`, copies only what the plugin needs
-(`manifest.json`, `*.qml`, `*.js`, `README.md`, `LICENSE`, `scripts/`, `docs/`,
-`assets/` — so `.git` and `PROMPT.md` stay out of the plugins dir), mirrors each
-file's executable bit, and runs `omarchy plugin validate` on the working tree
-*before* touching the installed copy, so a broken manifest leaves the running
-plugin alone.
+```sh
+omarchy plugin remove io.github.mdelgert.rdp-connections
+```
+
+That keeps a backup, and leaves state outside the plugin directory — such as
+saved credentials — alone.
 
 **Why a full shell restart rather than the file watcher?** Saving under
 `~/.config/omarchy/plugins/` does fire the shell's "plugin changed, reloading"
