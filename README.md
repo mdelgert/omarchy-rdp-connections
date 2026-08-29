@@ -242,21 +242,38 @@ A few warnings are expected and are qmllint limitations rather than defects:
 `Style.spacing` / `Style.font` are QtObject groups) and `Type PanelWindow is not
 creatable`. Omarchy's own polkit agent and panels report exactly the same ones.
 
-## Optional keybinding
+## Keyboard shortcut
 
-The widget registers an IPC handler, so the manager can be opened without the
-bar:
+The bar button is the primary entry point, but the widget also registers an IPC
+handler, so the manager can be opened without touching the bar:
 
 ```sh
 omarchy-shell io.github.mdelgert.rdp-connections open
 ```
 
-To bind it, add a line to `~/.config/hypr/bindings.lua` (check the key is free
-first with `omarchy menu keybindings --print`):
+To bind that to a key, add it to `~/.config/hypr/bindings.lua`:
 
 ```lua
-o.bind("SUPER + SHIFT + D", "RDP connections", "omarchy-shell io.github.mdelgert.rdp-connections open")
+-- RDP plugin
+o.bind("SUPER + R", "RDP connections", "omarchy-shell io.github.mdelgert.rdp-connections open")
 ```
+
+Hyprland picks the change up on save; no restart is needed. Confirm it landed
+with `hyprctl binds | grep -B8 "RDP connections"` — the entry should read
+`modmask: 64` (SUPER on its own) and `key: R`.
+
+`SUPER + R` is free on a stock Omarchy install. The three reminder shortcuts
+also use `R`, but each of them adds Ctrl (`modmask` 68, 76, and 69), so they do
+not collide. If you would rather use a different key, list what is already taken
+with:
+
+```sh
+omarchy menu keybindings --print
+```
+
+Note that the prompt opens on whichever monitor the shell puts the overlay on,
+which is not necessarily the one holding keyboard focus. Clicking the bar button
+instead always uses the bar you clicked.
 
 ## Scope of v0.1
 
