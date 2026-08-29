@@ -1,64 +1,238 @@
-# RDP Connections for Omarchy
+# RDP Connections
 
-A small Omarchy bar plugin for creating, selecting, editing, deleting, and launching RDP connections through `sdl-freerdp3` with Hyprland multi-monitor support.
+An [Omarchy](https://omarchy.org) Quattro bar plugin for saving, editing, and
+launching RDP connections through `sdl-freerdp3`, with working Hyprland
+multi-monitor fullscreen.
 
-## What it stores
+Click **RDP** in the bar and Omarchy's own menu offers **Connect**, **New
+connection**, **Edit connection**, and **Remove connection**. After installing
+the plugin, it needs no terminal commands.
 
-The connection display name and opaque ID are stored locally in:
-
-`~/.local/state/omarchy-rdp-connections/connections.json`
-
-Server, username, and password are stored in the logged-in user's Secret Service keyring using `secret-tool`; they are never written to that JSON file. The RDP password is necessarily supplied to `sdl-freerdp3` at launch, as in the original working command. It can therefore be briefly visible to other local processes through process arguments. This is a FreeRDP invocation limitation to resolve before calling the project production-ready.
+- Plugin ID: `io.github.mdelgert.rdp-connections`
+- Kind: `bar-widget`
 
 ## Dependencies
 
-- `freerdp` (`sdl-freerdp3`)
-- `libsecret` (`secret-tool`)
-- `fuzzel`
-- `jq`
-- `hyprland` (`hyprctl`)
+**None to install.** The plugin uses only what an Omarchy machine already has:
 
-On Arch:
+| Command                                | Comes from            |
+| -------------------------------------- | --------------------- |
+| `sdl-freerdp3`                         | `freerdp`             |
+| `secret-tool`                          | `libsecret`           |
+| `jq`, `hyprctl`, `notify-send`, `setsid` | base desktop        |
+| `omarchy-menu-select`, `omarchy-menu-input` | Omarchy itself   |
 
-```sh
-sudo pacman -S freerdp libsecret fuzzel jq
-```
-
-## Install locally
+The UI is Omarchy's own menu, so there is no `fuzzel`, `rofi`, or `walker`
+dependency. If you want to confirm before installing:
 
 ```sh
-plugin_dir="$HOME/.config/omarchy/plugins/io.github.mdelgert.rdp-connections"
-mkdir -p "$plugin_dir"
-cp -a . "$plugin_dir"
-chmod 700 "$plugin_dir/scripts/rdp-menu" "$plugin_dir/scripts/rdp-launch"
-omarchy plugin validate "$plugin_dir"
-omarchy-shell shell rescanPlugins
-omarchy plugin enable io.github.mdelgert.rdp-connections
+for c in sdl-freerdp3 secret-tool jq hyprctl notify-send setsid \
+         omarchy-menu-select omarchy-menu-input; do
+  printf '%-22s %s\n' "$c" "$(command -v "$c" || echo MISSING)"
+done
 ```
 
-Click the **RDP** bar item. The fuzzel menu offers **New connection**, **Connect**, **Edit**, and **Remove**.
+Everything should report a path. On the off chance `freerdp` or `libsecret` is
+absent, `sudo pacman -S --needed freerdp libsecret` fills the gap.
 
-## Install from GitHub
+The plugin ships no install hooks and never installs anything itself; a missing
+command is reported in a notification when you click **RDP**.
 
-After publishing this directory as the repository root:
+## Install
+
+### From GitHub
 
 ```sh
 omarchy plugin add https://github.com/mdelgert/omarchy-rdp-connections.git --enable
 ```
 
-## Validate while developing
+### From a local clone
+
+```sh
+plugin_dir="$HOME/.config/omarchy/plugins/io.github.mdelgert.rdp-connections"
+mkdir -p "$plugin_dir"
+cp -aT . "$plugin_dir"
+chmod 755 "$plugin_dir/scripts/rdp-menu" "$plugin_dir/scripts/rdp-launch"
+omarchy plugin validate "$plugin_dir"
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.mdelgert.rdp-connections
+```
+
+To move the button: `omarchy bar move io.github.mdelgert.rdp-connections --section center`.
+To uninstall: `omarchy plugin remove io.github.mdelgert.rdp-connections`.
+
+## How the UI is put together
+
+| File               | Role                                                     |
+| ------------------ | -------------------------------------------------------- |
+| `BarWidget.qml`    | the **RDP** button; runs the manager and relays its prompts |
+| `Panel.qml`        | the masked password field                                 |
+| `scripts/rdp-menu` | the manager: menus, keyring writes, index bookkeeping     |
+| `scripts/rdp-launch` | resolves Hyprland and starts `sdl-freerdp3`             |
+
+Pickers and text entry go through `omarchy-menu-select` and
+`omarchy-menu-input`, which summon Omarchy's first-party `omarchy.menu` plugin.
+
+The password is the one prompt that cannot: `omarchy-menu-input` renders what
+you type in the clear, and both helpers return their answer by writing it to a
+temp file and reading it back. So `rdp-menu` runs as a child of the bar widget
+rather than detached, and the two talk over its pipes — when it needs a
+password it writes `password\t<prompt>` on stdout and blocks, `Panel.qml` opens
+a masked field, and the answer comes back on stdin as `ok:<password>` (or
+`cancel`). This is the same approach as Omarchy's built-in Wi-Fi passphrase
+prompt, whose `Process` carries the secret over stdin with the note *"The
+password goes over stdin, never argv."*
+
+Run straight from a terminal there is no widget on the other end of the pipe,
+so the script falls back to a silent `read -rs` and stays directly testable.
+
+## Security model
+
+**Secrets never touch the filesystem.** Server, username, and password are held
+by the Secret Service keyring under a namespaced attribute set:
+
+| Attribute     | Value                               |
+| ------------- | ----------------------------------- |
+| `application` | `io.github.mdelgert.omarchy-rdp`    |
+| `connection`  | opaque random id, e.g. `conn-9f3a…` |
+| `field`       | `server`, `username`, or `password` |
+
+Inspect them yourself:
+
+```sh
+secret-tool search --all application io.github.mdelgert.omarchy-rdp
+```
+
+The only thing written to disk is an index of display names and opaque ids at
+`${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections/connections.json`
+(mode `600`, in a `700` directory):
+
+```json
+{ "connections": [ { "id": "conn-9f3a…", "name": "Work desktop" } ] }
+```
+
+No host, username, or password is written to that file, to a temp file, to a
+log, or into a desktop notification — notifications name a connection only by
+its display name. Values are passed to `secret-tool` on **stdin**, never as
+arguments.
+
+Editing changes one field at a time rather than walking every field, because
+`omarchy-menu-input` cannot prefill: showing you the current host or username
+would mean putting it in the helper's world-readable `/proc/<pid>/cmdline`.
+
+Display names are kept unique (a duplicate gets a ` (2)` suffix) so the picker
+always maps a chosen name back to exactly one connection.
+
+### The password is *not* exposed in the process list
+
+FreeRDP's usual `/p:<password>` puts the password in `argv`, and
+`/proc/<pid>/cmdline` is world-readable, so any local user can read it for as
+long as the session runs.
+
+FreeRDP 3 offers two ways out, and this plugin uses the stronger one:
+
+- `/from-stdin` — prompts for credentials on stdin, but only for fields that
+  were not supplied, and the prompt timing depends on `force` vs. server
+  request.
+- `/args-from:stdin` — reads the **entire** command line from stdin, one
+  argument per line. It cannot be combined with any other argument.
+
+`scripts/rdp-launch` builds the argument vector in shell variables and pipes it
+in with the `printf` builtin, so the credentials go straight down a pipe from
+the launcher process and are never another process's arguments:
+
+```sh
+printf '%s\n' "${args[@]}" | exec sdl-freerdp3 /args-from:stdin
+```
+
+Verified on FreeRDP 3.30.0 — the running client's full command line is:
+
+```
+sdl-freerdp3 /args-from:stdin
+```
+
+Residual exposure: the password is still in the FreeRDP process's heap, as it
+must be for any client, and any process able to read that memory (same user, or
+root) can recover it. `/proc/<pid>/environ` is owner-readable only, so the
+exported `HYPRLAND_INSTANCE_SIGNATURE` / `WAYLAND_DISPLAY` / `FREERDP_WLROOTS_HACK`
+values are not world-visible either.
+
+### The `/cert:ignore` tradeoff
+
+`/cert:ignore` accepts the server's TLS certificate without validating it and
+without prompting. That removes the certificate warning on self-signed hosts —
+the reason it is the common default for lab and internal machines — but it also
+**removes protection against an active man-in-the-middle**: an attacker who can
+redirect your traffic can present any certificate and silently relay the
+session, including your password and keystrokes.
+
+Use it only on networks you trust. On an untrusted network, edit
+`scripts/rdp-launch` and replace `/cert:ignore` with `/cert:tofu` (trust on
+first use, like SSH) or drop the flag entirely so FreeRDP prompts and pins.
+
+This is carried over from the launch command the plugin was built to reproduce;
+it is a deliberate, documented default, not an oversight.
+
+## How launching works
+
+`scripts/rdp-launch` reproduces the known-good invocation:
+
+1. Resolve the newest Hyprland instance with `hyprctl instances -j | jq`, and
+   export `HYPRLAND_INSTANCE_SIGNATURE` and `WAYLAND_DISPLAY` from it. The bar's
+   own environment can point at a stale compositor after a Hyprland restart.
+2. Export `FREERDP_WLROOTS_HACK=force`, without which `/multimon` fullscreen
+   lands on a single output.
+3. Launch `sdl-freerdp3` with `-grab-keyboard /sound /microphone /clipboard
+   /cert:ignore /dvc:rdpecam +f /multimon`.
+
+It is started with `setsid` so the RDP session outlives both the menu and a
+reload of the shell. Incomplete credentials — including a keyring that is
+locked or unavailable — abort with a desktop notification instead of launching.
+
+## Development
+
+Run the manager directly, without installing. Menus still come from the running
+shell; the password prompt falls back to a silent terminal read:
+
+```sh
+./scripts/rdp-menu
+```
+
+Validation that runs anywhere:
+
+```sh
+jq empty manifest.json
+bash -n scripts/rdp-menu scripts/rdp-launch
+shellcheck scripts/rdp-menu scripts/rdp-launch
+```
+
+Validation that needs an Omarchy host:
 
 ```sh
 omarchy plugin validate .
-qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml
+qmllint -I "$OMARCHY_PATH/shell" BarWidget.qml Panel.qml
 ```
 
-## Current deliberate constraints
+If `qmllint` reports that `qs.Ui` and `qs.Commons` cannot be imported, point it
+at a directory containing a `qs` entry for the shell instead — Quickshell
+exposes the shell root as the module `qs`:
 
-- Uses the exact SDL FreeRDP flags from the supplied successful command, including `/multimon`.
-- One fixed launch profile for all connections. Per-connection options, gateways, resolution, and certificate policy are future work.
-- The UI uses fuzzel (native to the Omarchy desktop workflow) rather than a larger QML editor panel; this keeps v0.1 low-risk and easy to audit.
+```sh
+mkdir -p /tmp/qsimports && ln -sfn "$OMARCHY_PATH/shell" /tmp/qsimports/qs
+qmllint -I /tmp/qsimports BarWidget.qml Panel.qml
+```
+
+A few `Member "x" not found on type "QObject"` warnings are expected: `Loader.item`
+is untyped and `Style.spacing` / `Style.font` are QtObject groups. Omarchy's own
+first-party panels report the same class of warning.
+
+## Scope of v0.1
+
+One launch profile for every connection, matching the command above.
+Per-connection resolution, gateways, `/drive:` redirection, and certificate
+policy are not configurable yet; edit `scripts/rdp-launch` if you need them
+today.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
