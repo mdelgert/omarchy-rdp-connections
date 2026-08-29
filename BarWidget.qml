@@ -101,7 +101,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "RDP"
+    text: "󰢹"
     tooltipText: "RDP connections"
     textRotation: root.vertical ? 90 : 0
     fixedHeight: root.vertical ? Math.round(labelMetrics.width + Style.spaceReal(8.5) * 2) : -1

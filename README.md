@@ -249,6 +249,53 @@ A few warnings are expected and are qmllint limitations rather than defects:
 `Style.spacing` / `Style.font` are QtObject groups) and `Type PanelWindow is not
 creatable`. Omarchy's own polkit agent and panels report exactly the same ones.
 
+### Reloading QML changes
+
+The shell only ever reads `~/.config/omarchy/plugins/<id>/`, never your
+checkout, so editing `BarWidget.qml` or `Panel.qml` here does nothing on its
+own. Install and reload in one step:
+
+```sh
+scripts/dev-install            # copy + restart the shell
+scripts/dev-install --enable   # ...and add it to the bar if it is not there
+scripts/dev-install --no-restart
+```
+
+It reads the id from `manifest.json`, copies only what the plugin needs
+(`manifest.json`, `*.qml`, `*.js`, `README.md`, `LICENSE`, `scripts/`, `docs/`,
+`assets/` — so `.git` and `PROMPT.md` stay out of the plugins dir), mirrors each
+file's executable bit, and runs `omarchy plugin validate` on the working tree
+*before* touching the installed copy, so a broken manifest leaves the running
+plugin alone.
+
+**Why a full shell restart rather than the file watcher?** Saving under
+`~/.config/omarchy/plugins/` does fire the shell's "plugin changed, reloading"
+watcher, but that does not re-instantiate a bar widget the bar is already
+holding: `BarWidget.qml` is mounted once per bar, and its bindings and
+`IpcHandler` are fixed at instantiation. `omarchy-shell shell rescanPlugins`
+does not pick those up either. Measured against a changed bar label:
+
+| Action | Reload event | Change actually applied |
+|--------|--------------|-------------------------|
+| Save in the repo only | no | no |
+| Copy into the plugins dir | yes | no |
+| `omarchy-shell shell rescanPlugins` | — | no |
+| `omarchy-restart-shell` | — | **yes** |
+
+Two things that will otherwise waste your time:
+
+- Use plain `cp`, never `cp -a`. `-a` preserves mtimes, and the watcher never
+  notices a file whose timestamp did not move. (The `cp -aT .` under
+  [From a local clone](#from-a-local-clone) is fine for a first install, which
+  ends in an explicit `rescanPlugins`, but it is not a reload loop.)
+- Do **not** symlink the plugin directory at your checkout. The shell will load
+  it, but the file watcher does not follow symlinks and
+  `omarchy plugin validate` rejects it outright with
+  `symlinks are not allowed inside a plugin folder`.
+
+Clearing `~/.cache/quickshell/qmlcache` is not necessary; the restart is
+sufficient.
+
 ## Keyboard shortcut
 
 The bar button is the primary entry point, but the widget also registers an IPC
@@ -290,5 +337,7 @@ policy are not configurable yet; edit `scripts/rdp-launch` if you need them
 today.
 
 ## License
+
+Icon provided by [Nerdfonts](https://www.nerdfonts.com/cheat-sheet)
 
 MIT — see [LICENSE](LICENSE).
