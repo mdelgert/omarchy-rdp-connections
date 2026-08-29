@@ -259,7 +259,18 @@ own. Install and reload in one step:
 scripts/dev-install            # copy + restart the shell
 scripts/dev-install --enable   # ...and add it to the bar if it is not there
 scripts/dev-install --no-restart
+
+scripts/dev-uninstall          # take it off the bar, delete the installed copy, reload
+scripts/dev-uninstall --yes    # skip the confirmation prompt
 ```
+
+`dev-uninstall` is the counterpart, for testing a clean-slate install: it
+disables the plugin, deletes `~/.config/omarchy/plugins/<id>/`, and restarts the
+shell. Your checkout is never touched. It refuses to delete a directory whose
+`manifest.json` carries a different id, and refuses outright if it finds a
+`.git` inside (that would be a real clone, not a dev install — use
+`omarchy plugin remove` for those, which keeps a backup). State outside the
+plugin directory, such as saved credentials, is deliberately left alone.
 
 It reads the id from `manifest.json`, copies only what the plugin needs
 (`manifest.json`, `*.qml`, `*.js`, `README.md`, `LICENSE`, `scripts/`, `docs/`,
