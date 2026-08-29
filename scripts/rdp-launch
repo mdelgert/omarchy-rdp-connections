@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# RDP Connections for Omarchy — launcher.
+# SPDX-License-Identifier: MIT
+#
+# Reads one connection's credentials from the Secret Service keyring and hands
+# them to sdl-freerdp3 over a pipe via /args-from:stdin, so nothing sensitive
+# reaches the world-readable /proc/<pid>/cmdline. See README.md.
+
+set -euo pipefail
+umask 077
+
+APP_ID="io.github.mdelgert.omarchy-rdp"
+
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send --app-name="RDP Connections" "RDP Connections" "$1" || true
+  else
+    printf 'RDP Connections: %s\n' "$1" >&2
+  fi
+}
+
+die() {
+  notify "$1"
+  exit 1
+}
+
+id="${1-}"
+[[ -n "$id" ]] || die "No connection was selected."
+
+for dep in jq hyprctl secret-tool sdl-freerdp3; do
+  command -v "$dep" >/dev/null 2>&1 || die "Missing dependency: $dep"
+done
+
+# ------------------------------------------------------------- credentials
+
+secret_get() {
+  secret-tool lookup application "$APP_ID" connection "$id" field "$1" 2>/dev/null || true
+}
+
+server="$(secret_get server)"
+username="$(secret_get username)"
+password="$(secret_get password)"
+
+# A locked or unavailable keyring reads as three empty values, so this covers
+# both "never finished saving" and "could not unlock". The message names
+# neither the host nor the account.
+if [[ -z "$server" || -z "$username" || -z "$password" ]]; then
+  die "Stored credentials are incomplete or the keyring is locked."
+fi
+
+# /args-from: takes one argument per line, so an embedded newline would inject
+# an extra argument. rdp-menu strips them on entry; this is the backstop for
+# items written by other tools.
+for value in "$server" "$username" "$password"; do
+  [[ "$value" != *$'\n'* ]] || die "Stored credentials contain a newline and cannot be used."
+done
+
+# ---------------------------------------------------------- hyprland socket
+
+# The bar's own environment can point at a stale compositor after a Hyprland
+# restart, so resolve the newest live instance instead of inheriting.
+mapfile -t hypr < <(hyprctl instances -j | jq -r 'sort_by(.time) | last | .instance, .wl_socket')
+signature="${hypr[0]-}"
+socket="${hypr[1]-}"
+if [[ -z "$signature" || -z "$socket" || "$signature" == "null" || "$socket" == "null" ]]; then
+  die "No running Hyprland instance was found."
+fi
+
+export HYPRLAND_INSTANCE_SIGNATURE="$signature"
+export WAYLAND_DISPLAY="$socket"
+
+# SDL FreeRDP needs this to place its fullscreen surfaces correctly under
+# wlroots-based compositors; without it /multimon lands on one output.
+export FREERDP_WLROOTS_HACK=force
+
+# ------------------------------------------------------------------- launch
+
+args=(
+  "/v:$server"
+  "/u:$username"
+  "/p:$password"
+  -grab-keyboard
+  /sound
+  /microphone
+  /clipboard
+  /cert:ignore
+  /dvc:rdpecam
+  +f
+  /multimon
+)
+
+# printf is a shell builtin, so the credentials are written straight down the
+# pipe by this process and never become another process's arguments.
+printf '%s\n' "${args[@]}" | exec sdl-freerdp3 /args-from:stdin

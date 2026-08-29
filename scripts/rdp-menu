@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# RDP Connections for Omarchy — connection manager.
+# SPDX-License-Identifier: MIT
+#
+# The UI is Omarchy's own menu: omarchy-menu-select for pickers and
+# omarchy-menu-input for text. Neither can mask input, and both return their
+# answer through a temp file, so the password is never asked for that way —
+# the bar widget collects it in a QML password field and passes it down this
+# script's stdin. See README.md.
+#
+# Security model: server, username and password live only in the Secret
+# Service keyring. The JSON index on disk holds nothing but opaque ids — a
+# connection is labelled by its server, and that label is read back out of the
+# keyring at display time rather than cached on disk. No secret is ever passed
+# as a command-line argument, written to a temp file, echoed to a log, or
+# included in a notification.
+
+set -euo pipefail
+umask 077
+
+APP_ID="io.github.mdelgert.omarchy-rdp"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections"
+INDEX_FILE="$STATE_DIR/connections.json"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Glyphs are taken from the set Omarchy's own menu already renders, so they
+# resolve in whatever Nerd Font the menu is configured with. Written as escapes
+# rather than literal characters so they survive copying and editing intact.
+GLYPH_CONNECT=$'\U000F14DE'  # trigger
+GLYPH_NEW=$'\U000F0249'      # install
+GLYPH_EDIT=$'\uE615'         # setup
+GLYPH_REMOVE=$'\U000F0B4C'   # remove
+GLYPH_HOST=$'\U000F0379'     # monitor
+
+# stdin is the channel back to the bar widget. Stash it on fd 3 and take
+# stdin away from everything else, so no helper can swallow the answer.
+# Run straight from a terminal there is no widget, so fall back to a silent
+# tty read and the script stays directly testable.
+INTERACTIVE=0
+if [[ -t 0 ]]; then
+  INTERACTIVE=1
+else
+  exec 3<&0 4>&1
+fi
+exec 0</dev/null
+
+# ---------------------------------------------------------------- messaging
+
+# Notifications carry a connection name at most; never a host, user or secret.
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send --app-name="RDP Connections" "RDP Connections" "$1" || true
+  else
+    printf 'RDP Connections: %s\n' "$1" >&2
+  fi
+}
+
+die() {
+  notify "$1"
+  exit 1
+}
+
+for dep in jq flock secret-tool omarchy-menu-select omarchy-menu-input; do
+  command -v "$dep" >/dev/null 2>&1 || die "Missing dependency: $dep"
+done
+
+# -------------------------------------------------------------- index store
+
+mkdir -p -- "$STATE_DIR"
+chmod 700 -- "$STATE_DIR" 2>/dev/null || true
+
+# One menu at a time. The bar instantiates this widget once per monitor, so
+# without this guard two menus can be open side by side — and because updating
+# the index means read, modify, write, the second one to save silently drops
+# whatever the first one added. The lock is released when this process exits,
+# including the setsid handoff in connect_connection, so it cannot go stale.
+exec 9>"$STATE_DIR/.menu.lock"
+if ! flock -n 9; then
+  notify "A connection menu is already open."
+  exit 0
+fi
+
+[[ -e "$INDEX_FILE" ]] || printf '%s\n' '{"connections":[]}' >"$INDEX_FILE"
+jq -e 'has("connections") and (.connections | type == "array")' "$INDEX_FILE" >/dev/null 2>&1 \
+  || die "Connection index is unreadable: $INDEX_FILE"
+
+# Replace the index with the JSON on stdin, but only once it has been proven
+# to parse — a failed jq upstream must never truncate the user's connections.
+write_index() {
+  local tmp
+  tmp="$(mktemp -- "$INDEX_FILE.XXXXXX")"
+  if cat >"$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
+    mv -f -- "$tmp" "$INDEX_FILE"
+  else
+    rm -f -- "$tmp"
+    die "Failed to update the connection index."
+  fi
+}
+
+new_id() {
+  printf 'conn-%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+}
+
+# A connection is identified in the UI by its server. Two connections may
+# legitimately point at the same host, so a repeat gets a counter appended for
+# display only — enough to tell the rows apart and to map a choice back to one
+# id, without inventing a second name the user has to maintain.
+#
+# Fills the caller's LABELS and IDS arrays, in index order.
+build_labels() {
+  local id server label
+  declare -A seen=()
+  LABELS=()
+  IDS=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    server="$(secret_get "$id" server)"
+    [[ -n "$server" ]] || server="(unavailable — keyring locked?)"
+    if [[ -n "${seen[$server]:-}" ]]; then
+      seen["$server"]=$(( seen["$server"] + 1 ))
+      label="$server (${seen[$server]})"
+    else
+      seen["$server"]=1
+      label="$server"
+    fi
+    LABELS+=("$label")
+    IDS+=("$id")
+  done < <(jq -r '.connections[].id' "$INDEX_FILE")
+}
+
+label_for_id() {
+  local id="$1" i
+  local -a LABELS=() IDS=()
+  build_labels
+  for i in "${!IDS[@]}"; do
+    [[ "${IDS[$i]}" == "$id" ]] && { printf '%s' "${LABELS[$i]}"; return 0; }
+  done
+  printf '%s' "a connection"
+}
+
+# ------------------------------------------------------------------ secrets
+
+secret_get() {
+  secret-tool lookup application "$APP_ID" connection "$1" field "$2" 2>/dev/null || true
+}
+
+# The value arrives on stdin, never in argv. secret-tool requires the trailing
+# newline: fed a bare value with no newline it exits 0 and stores nothing.
+secret_set() {
+  local id="$1" label="$2" field="$3" value="$4"
+  printf '%s\n' "$value" |
+    secret-tool store --label="Omarchy RDP: $label ($field)" \
+      application "$APP_ID" connection "$id" field "$field" || return 1
+  # secret-tool has been seen to exit 0 having created the item but committed
+  # no secret, which leaves a connection that looks saved and cannot log in.
+  # Read it straight back rather than trust the exit status.
+  [[ "$(secret_get "$id" "$field")" == "$value" ]]
+}
+
+secret_forget() {
+  local id="$1" field
+  for field in server username password; do
+    secret-tool clear application "$APP_ID" connection "$id" field "$field" 2>/dev/null || true
+  done
+}
+
+# ----------------------------------------------------------------------- ui
+
+# Both helpers exit non-zero when the user presses Escape, and
+# omarchy-menu-input also exits non-zero on an empty answer, so a caller only
+# has to check the status to know it should stop.
+pick() {
+  local prompt="$1"
+  shift
+  omarchy-menu-select "$prompt" "$@" </dev/null
+}
+
+ask() {
+  omarchy-menu-input "$1" --width 420 </dev/null
+}
+
+# Asks the bar widget for a masked password: the request goes out on fd 4 and
+# the answer comes back on fd 3, so the value only ever exists in this shell's
+# memory and in the widget's field.
+#
+# The answer is handed back in a global rather than on stdout because this has
+# to run in the main shell. Inside "$( )" the request line would be captured
+# by the substitution instead of reaching the widget, and the widget would
+# wait for a prompt it never saw while the script waited for an answer.
+SECRET_REPLY=""
+
+ask_secret() {
+  local prompt="$1" line
+  SECRET_REPLY=""
+  if (( INTERACTIVE )); then
+    read -rsp "$prompt: " line </dev/tty
+    printf '\n' >/dev/tty
+    SECRET_REPLY="$line"
+    return 0
+  fi
+  printf 'password\t%s\n' "$(sanitize "$prompt")" >&4
+  IFS= read -r line <&3 || return 1
+  case "$line" in
+    ok:*) SECRET_REPLY="${line#ok:}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Newlines and tabs would corrupt the menu's option encoding, this script's
+# own protocol, and the argument stream handed to FreeRDP.
+sanitize() {
+  local value="$1"
+  printf '%s' "${value//[$'\t\r\n']/}"
+}
+
+choose_id() {
+  local -a LABELS=() IDS=() options=()
+  local chosen i
+  build_labels
+  (( ${#IDS[@]} > 0 )) || {
+    notify "No saved connections yet — choose “New connection” first."
+    return 1
+  }
+  for i in "${!LABELS[@]}"; do
+    options+=("$GLYPH_HOST"$'\t'"${LABELS[$i]}")
+  done
+  chosen="$(pick "$1" "${options[@]}")" || return 1
+  for i in "${!LABELS[@]}"; do
+    [[ "${LABELS[$i]}" == "$chosen" ]] && { printf '%s' "${IDS[$i]}"; return 0; }
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------ actions
+
+# Every prompt is read into `raw` first: the helpers exit non-zero when the
+# user presses Escape, and that status is only visible on the assignment
+# itself — wrapping the prompt in sanitize() would swallow it and turn a
+# cancel into an empty string.
+#
+# Notifications never name the server. The user is looking at the screen when
+# they act; a notification outlives the moment and can sit in a shared history.
+
+new_connection() {
+  local raw server username password id
+  raw="$(ask 'Server (host or host:port)')" || return 0
+  server="$(sanitize "$raw")"
+  [[ -n "$server" ]] || return 0
+  raw="$(ask 'Username (user or DOMAIN\user)')" || return 0
+  username="$(sanitize "$raw")"
+  [[ -n "$username" ]] || { notify "Username is required — nothing saved."; return 0; }
+
+  ask_secret "Password for $server" || { notify "Cancelled — nothing saved."; return 0; }
+  password="$(sanitize "$SECRET_REPLY")"
+  SECRET_REPLY=""
+  [[ -n "$password" ]] || { notify "Password is required — nothing saved."; return 0; }
+
+  id="$(new_id)"
+  secret_set "$id" "$server" server "$server" || die "Could not write to the keyring."
+  secret_set "$id" "$server" username "$username" || die "Could not write to the keyring."
+  secret_set "$id" "$server" password "$password" || die "Could not write to the keyring."
+  jq --arg id "$id" '.connections += [{id: $id}]' "$INDEX_FILE" | write_index
+  notify "Connection saved."
+}
+
+# One field at a time. omarchy-menu-input cannot prefill, and putting the
+# current host or username into a prompt would publish it in the helper's
+# world-readable /proc/<pid>/cmdline, so the menu asks what to change instead
+# of walking every field on every edit.
+edit_connection() {
+  local id label field raw value
+  id="$(choose_id 'Edit')" || return 0
+
+  while true; do
+    label="$(label_for_id "$id")"
+    field="$(pick "Edit $label" \
+      "$GLYPH_HOST	Server" \
+      "$GLYPH_EDIT	Username" \
+      "$GLYPH_EDIT	Password")" || return 0
+
+    case "$field" in
+      Server)
+        raw="$(ask 'New server (host or host:port)')" || continue
+        value="$(sanitize "$raw")"
+        [[ -n "$value" ]] || continue
+        secret_set "$id" "$value" server "$value" || die "Could not write to the keyring."
+        notify "Server updated."
+        ;;
+      Username)
+        raw="$(ask 'New username (user or DOMAIN\user)')" || continue
+        value="$(sanitize "$raw")"
+        [[ -n "$value" ]] || continue
+        secret_set "$id" "$(secret_get "$id" server)" username "$value" \
+          || die "Could not write to the keyring."
+        notify "Username updated."
+        ;;
+      Password)
+        ask_secret "New password for $label" || continue
+        value="$(sanitize "$SECRET_REPLY")"
+        SECRET_REPLY=""
+        [[ -n "$value" ]] || continue
+        secret_set "$id" "$(secret_get "$id" server)" password "$value" \
+          || die "Could not write to the keyring."
+        notify "Password updated."
+        ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+remove_connection() {
+  local id label answer
+  id="$(choose_id 'Remove')" || return 0
+  label="$(label_for_id "$id")"
+  answer="$(pick "Remove $label?" 'Cancel' "$GLYPH_REMOVE	Remove $label")" || return 0
+  [[ "$answer" == "Remove $label" ]] || return 0
+
+  # Drop the index entry first: an entry with no keyring items is a visible,
+  # repairable state, whereas orphaned keyring items are invisible.
+  jq --arg id "$id" '.connections |= map(select(.id != $id))' "$INDEX_FILE" | write_index
+  secret_forget "$id"
+  notify "Connection removed."
+}
+
+# Detached on purpose: the RDP session has to outlive both this menu and a
+# reload of the shell that spawned it.
+connect_connection() {
+  local id
+  id="$(choose_id 'Connect')" || return 0
+  # 9>&- drops the menu lock for the launched client. Without it rdp-launch
+  # inherits the descriptor and holds the lock for the whole RDP session, so
+  # the menu could not be reopened until the connection was closed.
+  setsid --fork "$SCRIPT_DIR/rdp-launch" "$id" 9>&- </dev/null >/dev/null 2>&1
+  exit 0
+}
+
+# -------------------------------------------------------------------- entry
+
+while true; do
+  action="$(pick 'RDP' \
+    "$GLYPH_CONNECT	Connect" \
+    "$GLYPH_NEW	New connection" \
+    "$GLYPH_EDIT	Edit connection" \
+    "$GLYPH_REMOVE	Remove connection")" || exit 0
+  case "$action" in
+    'Connect') connect_connection ;;
+    'New connection') new_connection ;;
+    'Edit connection') edit_connection ;;
+    'Remove connection') remove_connection ;;
+    *) exit 0 ;;
+  esac
+done

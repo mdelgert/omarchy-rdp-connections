@@ -1,0 +1,10 @@
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Nothing this plugin writes at runtime belongs in the repo. State lives in
+# $XDG_STATE_HOME/omarchy-rdp-connections, secrets live in the keyring.
+*.tmp
