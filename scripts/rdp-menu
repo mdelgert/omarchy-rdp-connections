@@ -86,16 +86,34 @@ jq -e 'has("connections") and (.connections | type == "array")' "$INDEX_FILE" >/
 
 # Replace the index with the JSON on stdin, but only once it has been proven
 # to parse — a failed jq upstream must never truncate the user's connections.
+# The temp file is created by mktemp inside the owner-only state directory
+# (never /tmp) and is removed on every exit path, including a signal that lands
+# between mktemp and mv. mv within one directory is atomic, so a reader either
+# sees the whole old index or the whole new one.
+INDEX_TMP=""
+# Must end on a true status. Under `set -e` a failing EXIT trap sets the exit
+# code, so without the explicit `return 0` the common case — nothing to clean,
+# so the `[[ -n ... ]]` test is false — would report failure.
+cleanup() {
+  [[ -n "$INDEX_TMP" ]] && rm -f -- "$INDEX_TMP"
+  INDEX_TMP=""
+  return 0
+}
+trap cleanup EXIT INT TERM HUP
+
 write_index() {
-  local tmp
-  tmp="$(mktemp -- "$INDEX_FILE.XXXXXX")"
-  if cat >"$tmp" && jq -e . "$tmp" >/dev/null 2>&1; then
-    mv -f -- "$tmp" "$INDEX_FILE"
+  INDEX_TMP="$(mktemp -- "$INDEX_FILE.XXXXXX")"
+  if cat >"$INDEX_TMP" && jq -e . "$INDEX_TMP" >/dev/null 2>&1; then
+    mv -f -- "$INDEX_TMP" "$INDEX_FILE"
+    INDEX_TMP=""
   else
-    rm -f -- "$tmp"
+    cleanup
     die "Failed to update the connection index."
   fi
 }
+
+# Clear anything a previous run left behind if it was killed uncatchably.
+rm -f -- "$INDEX_FILE".??????
 
 new_id() {
   printf 'conn-%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
