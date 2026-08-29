@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+APP_ID="io.github.mdelgert.omarchy-rdp"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections"
+STATE_FILE="$STATE_DIR/connections.json"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+[[ -f "$STATE_FILE" ]] || printf '%s\n' '{"connections":[]}' >"$STATE_FILE"
+chmod 600 "$STATE_FILE"
+
+require() { command -v "$1" >/dev/null || { notify-send "RDP Connections" "Missing dependency: $1"; exit 1; }; }
+for command in jq fuzzel secret-tool; do require "$command"; done
+
+pick() { fuzzel --dmenu --prompt="$1"; }
+prompt() { fuzzel --dmenu --prompt="$1" --placeholder="$2"; }
+secret_get() { secret-tool lookup application "$APP_ID" connection "$1" field "$2" 2>/dev/null || true; }
+secret_put() { printf '%s' "$3" | secret-tool store --label="Omarchy RDP: $2" application "$APP_ID" connection "$1" field "$4"; }
+
+new_connection() {
+  local name server username password id
+  name="$(prompt 'Connection name: ' 'e.g. Work desktop')" || return
+  [[ -n "$name" ]] || return
+  server="$(prompt 'Server: ' 'host or host:port')" || return
+  [[ -n "$server" ]] || return
+  username="$(prompt 'Username: ' 'DOMAIN\\user or user')" || return
+  [[ -n "$username" ]] || return
+  password="$(fuzzel --dmenu --password --prompt='Password: ')" || return
+  id="$(date +%s%N)-$RANDOM"
+  secret_put "$id" "$name" "$server" server
+  secret_put "$id" "$name" "$username" username
+  secret_put "$id" "$name" "$password" password
+  jq --arg id "$id" --arg name "$name" '.connections += [{id:$id,name:$name}]' "$STATE_FILE" >"$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+  notify-send "RDP Connections" "Saved $name"
+}
+
+choose_connection() {
+  jq -r '.connections[] | "\(.id)\t\(.name)"' "$STATE_FILE" | cut -f2- | pick 'RDP: '
+}
+
+id_for_name() { jq -r --arg name "$1" '.connections[] | select(.name == $name) | .id' "$STATE_FILE" | head -n1; }
+
+edit_connection() {
+  local name id server username password
+  name="$(choose_connection)" || return
+  [[ -n "$name" ]] || return
+  id="$(id_for_name "$name")"
+  server="$(prompt 'Server: ' "$(secret_get "$id" server)")" || return
+  username="$(prompt 'Username: ' "$(secret_get "$id" username)")" || return
+  password="$(fuzzel --dmenu --password --prompt='New password (blank keeps existing): ')" || return
+  [[ -n "$server" ]] && secret_put "$id" "$name" "$server" server
+  [[ -n "$username" ]] && secret_put "$id" "$name" "$username" username
+  [[ -n "$password" ]] && secret_put "$id" "$name" "$password" password
+  notify-send "RDP Connections" "Updated $name"
+}
+
+remove_connection() {
+  local name id answer
+  name="$(choose_connection)" || return
+  [[ -n "$name" ]] || return
+  answer="$(printf 'Cancel\nRemove %s' "$name" | pick 'Confirm: ')" || return
+  [[ "$answer" == "Remove $name" ]] || return
+  id="$(id_for_name "$name")"
+  # Clear all three keyring items. An unavailable keyring should not remove state.
+  secret-tool clear application "$APP_ID" connection "$id" field server
+  secret-tool clear application "$APP_ID" connection "$id" field username
+  secret-tool clear application "$APP_ID" connection "$id" field password
+  jq --arg id "$id" '.connections |= map(select(.id != $id))' "$STATE_FILE" >"$STATE_FILE.tmp"
+  mv "$STATE_FILE.tmp" "$STATE_FILE"
+  notify-send "RDP Connections" "Removed $name"
+}
+
+launch_connection() {
+  local name id
+  name="$(choose_connection)" || return
+  [[ -n "$name" ]] || return
+  id="$(id_for_name "$name")"
+  exec "$SCRIPT_DIR/rdp-launch" "$id"
+}
+
+action="$(printf 'Connect\nNew connection\nEdit connection\nRemove connection' | pick 'RDP: ')" || exit 0
+case "$action" in
+  Connect) launch_connection ;;
+  'New connection') new_connection ;;
+  'Edit connection') edit_connection ;;
+  'Remove connection') remove_connection ;;
+esac

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mdelgert.rdp-connections",
+  "name": "RDP Connections",
+  "version": "0.1.0",
+  "author": "Matthew Elgert",
+  "license": "MIT",
+  "description": "Launch and manage SDL FreeRDP connections from the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "RDP Connections",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

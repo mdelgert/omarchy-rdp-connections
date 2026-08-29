@@ -1,0 +1,9 @@
+# Temporary JSON files created during atomic connection-index updates
+*.tmp
+
+# Local editor / OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
