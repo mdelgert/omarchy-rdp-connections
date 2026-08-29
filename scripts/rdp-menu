@@ -57,7 +57,7 @@ die() {
   exit 1
 }
 
-for dep in jq secret-tool omarchy-menu-select omarchy-menu-input; do
+for dep in jq flock secret-tool omarchy-menu-select omarchy-menu-input; do
   command -v "$dep" >/dev/null 2>&1 || die "Missing dependency: $dep"
 done
 
@@ -65,6 +65,18 @@ done
 
 mkdir -p -- "$STATE_DIR"
 chmod 700 -- "$STATE_DIR" 2>/dev/null || true
+
+# One menu at a time. The bar instantiates this widget once per monitor, so
+# without this guard two menus can be open side by side — and because updating
+# the index means read, modify, write, the second one to save silently drops
+# whatever the first one added. The lock is released when this process exits,
+# including the setsid handoff in connect_connection, so it cannot go stale.
+exec 9>"$STATE_DIR/.menu.lock"
+if ! flock -n 9; then
+  notify "A connection menu is already open."
+  exit 0
+fi
+
 [[ -e "$INDEX_FILE" ]] || printf '%s\n' '{"connections":[]}' >"$INDEX_FILE"
 jq -e 'has("connections") and (.connections | type == "array")' "$INDEX_FILE" >/dev/null 2>&1 \
   || die "Connection index is unreadable: $INDEX_FILE"
@@ -294,7 +306,10 @@ remove_connection() {
 connect_connection() {
   local id
   id="$(choose_id 'Connect')" || return 0
-  setsid --fork "$SCRIPT_DIR/rdp-launch" "$id" </dev/null >/dev/null 2>&1
+  # 9>&- drops the menu lock for the launched client. Without it rdp-launch
+  # inherits the descriptor and holds the lock for the whole RDP session, so
+  # the menu could not be reopened until the connection was closed.
+  setsid --fork "$SCRIPT_DIR/rdp-launch" "$id" 9>&- </dev/null >/dev/null 2>&1
   exit 0
 }
 

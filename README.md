@@ -19,14 +19,14 @@ the plugin, it needs no terminal commands.
 | -------------------------------------- | --------------------- |
 | `sdl-freerdp3`                         | `freerdp`             |
 | `secret-tool`                          | `libsecret`           |
-| `jq`, `hyprctl`, `notify-send`, `setsid` | base desktop        |
+| `jq`, `hyprctl`, `notify-send`, `setsid`, `flock` | base desktop |
 | `omarchy-menu-select`, `omarchy-menu-input` | Omarchy itself   |
 
 The UI is Omarchy's own menu, so there is no `fuzzel`, `rofi`, or `walker`
 dependency. If you want to confirm before installing:
 
 ```sh
-for c in sdl-freerdp3 secret-tool jq hyprctl notify-send setsid \
+for c in sdl-freerdp3 secret-tool jq hyprctl notify-send setsid flock \
          omarchy-menu-select omarchy-menu-input; do
   printf '%-22s %s\n' "$c" "$(command -v "$c" || echo MISSING)"
 done
@@ -66,7 +66,7 @@ To uninstall: `omarchy plugin remove io.github.mdelgert.rdp-connections`.
 | File               | Role                                                     |
 | ------------------ | -------------------------------------------------------- |
 | `BarWidget.qml`    | the **RDP** button; runs the manager and relays its prompts |
-| `Panel.qml`        | the masked password field                                 |
+| `Panel.qml`        | the masked password prompt, a centred overlay             |
 | `scripts/rdp-menu` | the manager: menus, keyring writes, index bookkeeping     |
 | `scripts/rdp-launch` | resolves Hyprland and starts `sdl-freerdp3`             |
 
@@ -82,6 +82,13 @@ a masked field, and the answer comes back on stdin as `ok:<password>` (or
 `cancel`). This is the same approach as Omarchy's built-in Wi-Fi passphrase
 prompt, whose `Process` carries the secret over stdin with the note *"The
 password goes over stdin, never argv."*
+
+The prompt itself is built like the shell's polkit agent and lock screen — a
+full-screen overlay with the card centred and exclusive keyboard focus — rather
+than as a bar panel hanging off the **RDP** button. The three prompts before it
+are Omarchy's menu card in the middle of the screen, so a panel pinned to the
+corner would move the flow out from under you halfway through. Clicking off the
+card refocuses it rather than dismissing; Escape cancels.
 
 Run straight from a terminal there is no widget on the other end of the pipe,
 so the script falls back to a silent `read -rs` and stays directly testable.
@@ -122,6 +129,14 @@ would mean putting it in the helper's world-readable `/proc/<pid>/cmdline`.
 
 Display names are kept unique (a duplicate gets a ` (2)` suffix) so the picker
 always maps a chosen name back to exactly one connection.
+
+Only one manager runs at a time, enforced with `flock` on
+`.menu.lock` in the state directory. The bar instantiates the widget once per
+monitor, so two menus could otherwise be open at once — and since saving means
+read, modify, write of the index, the second one to save would silently drop
+whatever the first had added. A second attempt reports "A connection menu is
+already open" instead. The launched RDP client is given the lock descriptor
+closed (`9>&-`), so a live session does not block reopening the menu.
 
 ### The password is *not* exposed in the process list
 
@@ -222,9 +237,26 @@ mkdir -p /tmp/qsimports && ln -sfn "$OMARCHY_PATH/shell" /tmp/qsimports/qs
 qmllint -I /tmp/qsimports BarWidget.qml Panel.qml
 ```
 
-A few `Member "x" not found on type "QObject"` warnings are expected: `Loader.item`
-is untyped and `Style.spacing` / `Style.font` are QtObject groups. Omarchy's own
-first-party panels report the same class of warning.
+A few warnings are expected and are qmllint limitations rather than defects:
+`Member "x" not found on type "QObject"` (`Loader.item` is untyped, and
+`Style.spacing` / `Style.font` are QtObject groups) and `Type PanelWindow is not
+creatable`. Omarchy's own polkit agent and panels report exactly the same ones.
+
+## Optional keybinding
+
+The widget registers an IPC handler, so the manager can be opened without the
+bar:
+
+```sh
+omarchy-shell io.github.mdelgert.rdp-connections open
+```
+
+To bind it, add a line to `~/.config/hypr/bindings.lua` (check the key is free
+first with `omarchy menu keybindings --print`):
+
+```lua
+o.bind("SUPER + SHIFT + D", "RDP connections", "omarchy-shell io.github.mdelgert.rdp-connections open")
+```
 
 ## Scope of v0.1
 

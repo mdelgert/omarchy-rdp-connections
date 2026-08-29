@@ -36,22 +36,8 @@ BarWidget {
       panelLoader.item.ask(tab < 0 ? "" : text.substring(tab + 1))
   }
 
-  function injectPanel() {
-    var target = panelLoader.item
-    if (!target)
-      return
-    if ("bar" in target)
-      target.bar = root.bar
-    if ("anchorItem" in target)
-      target.anchorItem = button
-    if ("hostWidget" in target)
-      target.hostWidget = root
-  }
-
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
-
-  onBarChanged: injectPanel()
 
   // Lets a Hyprland keybinding open the manager without going to the bar:
   //   omarchy-shell io.github.mdelgert.rdp-connections open
@@ -73,18 +59,16 @@ BarWidget {
     }
     // A script that died mid-prompt is never going to read the answer, so the
     // field must not be left sitting open waiting to send one.
-    onExited: if (panelLoader.item && panelLoader.item.pending) panelLoader.item.close()
+    onExited: if (panelLoader.item) panelLoader.item.abort()
   }
 
+  // The prompt is a screen-centred overlay of its own, so it needs nothing
+  // injected from the bar — no anchor item, no host widget, no popout
+  // coordination.
   Loader {
     id: panelLoader
     active: true
     source: Qt.resolvedUrl("Panel.qml")
-    visible: false
-    onLoaded: {
-      root.injectPanel()
-      Qt.callLater(root.injectPanel)
-    }
   }
 
   // onExited closes an open panel, which comes back here as a cancel, so both
