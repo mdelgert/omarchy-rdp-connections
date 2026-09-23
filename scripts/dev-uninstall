@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# Remove this plugin from the Omarchy plugins directory and reload the shell.
+#
+# Usage: scripts/dev-uninstall [--no-restart] [--yes]
+#
+# The counterpart to dev-install: it takes the plugin off the bar, deletes the
+# installed copy, and restarts the shell so the running desktop actually
+# forgets it. Your checkout is never touched — re-run dev-install to put it
+# back.
+#
+# Not a substitute for `omarchy plugin remove`, which is the user-facing
+# command and keeps a timestamped backup. This is the dev loop: it deletes
+# outright, because the installed copy is disposable and regenerated in a
+# second from the working tree.
+
+set -uo pipefail
+
+repo_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+plugins_dir="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins"
+
+restart=1
+assume_yes=0
+
+while (( $# )); do
+  case "$1" in
+    --no-restart) restart=0;    shift ;;
+    --yes|-y)     assume_yes=1; shift ;;
+    -h|--help)    sed -n '2,5p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) printf 'dev-uninstall: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+done
+
+fail() { printf 'dev-uninstall: %s\n' "$*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+[[ -f $repo_dir/manifest.json ]] || fail "no manifest.json in $repo_dir"
+
+id="$(jq -r '.id // empty' "$repo_dir/manifest.json")"
+[[ -n $id ]] || fail "manifest.json has no id"
+[[ $id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && $id != *..* ]] || fail "invalid plugin id '$id'"
+
+target="$plugins_dir/$id"
+
+if [[ ! -e $target && ! -L $target ]]; then
+  printf '%s is not installed at %s; nothing to do.\n' "$id" "$target"
+  exit 0
+fi
+
+# ---- Safety. This is the only rm -rf in the repo, so the path is proven to
+#      be the thing we think it is before anything is deleted.
+
+# Guard the obvious catastrophes first: an empty or root-ish path can only
+# come from a bug above, and must never reach rm.
+[[ -n $target && $target != "/" && $target != "$plugins_dir" ]] || fail "refusing to delete '$target'"
+[[ $target == "$plugins_dir/"* ]] || fail "refusing to delete outside $plugins_dir"
+
+if [[ -L $target ]]; then
+  # A symlinked plugin dir points at a real checkout; unlink it, never
+  # follow it into someone's source tree.
+  printf 'Unlinking symlink %s -> %s\n' "$target" "$(readlink "$target")"
+  rm -f "$target"
+  installed_removed=1
+else
+  [[ -d $target ]] || fail "$target is not a directory"
+
+  # The installed copy must be the plugin this repo describes. Deleting a
+  # directory because its *name* matched would be enough to lose someone's
+  # work if an id were ever reused.
+  installed_id="$(jq -r '.id // empty' "$target/manifest.json" 2>/dev/null)"
+  [[ $installed_id == "$id" ]] || fail "$target/manifest.json has id '$installed_id', expected '$id'"
+
+  # dev-install never puts a .git in the plugins dir. Finding one means this
+  # is a real clone (someone cloned straight into the plugins directory), and
+  # deleting it could destroy uncommitted work.
+  if [[ -e $target/.git ]]; then
+    fail "$target contains a .git — that is a clone, not a dev install. Use: omarchy plugin remove $id"
+  fi
+
+  if (( ! assume_yes )) && [[ -t 0 && -t 1 ]]; then
+    printf 'Delete %s? [y/N] ' "$target"
+    read -r reply
+    [[ $reply == [yY]* ]] || fail "aborted"
+  fi
+  installed_removed=0
+fi
+
+# ---- Stop anything the plugin left running, before its scripts are deleted.
+#
+# A plugin whose daemon outlives the session (lan-mouse starts one with
+# setsid) would otherwise be orphaned: the process keeps running with no UI
+# and no script left to stop it. Running it from the installed copy while
+# that copy still exists is the last moment this can be done cleanly.
+if (( ! installed_removed )) && [[ -x $target/scripts/stop-daemon ]]; then
+  printf 'Stopping the plugin daemon...\n'
+  "$target/scripts/stop-daemon" || printf 'dev-uninstall: stop-daemon reported a problem; continuing\n' >&2
+fi
+
+# Take it off the bar first, so shell.json does not keep an entry pointing at
+# files that are about to disappear.
+if command -v omarchy >/dev/null 2>&1; then
+  enabled="$(omarchy-shell shell listPlugins 2>/dev/null |
+    jq -r --arg id "$id" '.[] | select(.id == $id) | .enabled')"
+  if [[ $enabled == "true" ]]; then
+    printf 'Disabling %s...\n' "$id"
+    omarchy plugin disable "$id" >/dev/null 2>&1 ||
+      printf 'dev-uninstall: could not disable %s; continuing\n' "$id" >&2
+  fi
+fi
+
+if (( ! installed_removed )); then
+  rm -rf "$target" || fail "could not remove $target"
+fi
+printf 'Removed %s from %s\n' "$id" "$plugins_dir"
+
+if (( restart )); then
+  command -v omarchy-restart-shell >/dev/null 2>&1 || fail "omarchy-restart-shell not found"
+  printf 'Restarting the Omarchy shell...\n'
+
+  # Same reason as dev-install: omarchy-restart-shell returns before the
+  # outgoing shell is gone, and that shell answers `ping` on its way out.
+  old_pid="$(pgrep -f 'quickshell .*-p .*/shell' | head -n 1)"
+  omarchy-restart-shell >/dev/null 2>&1
+
+  ready=0
+  deadline=$(( SECONDS + 30 ))
+  while (( SECONDS < deadline )); do
+    new_pid="$(pgrep -f 'quickshell .*-p .*/shell' | head -n 1)"
+    if [[ -n $new_pid && $new_pid != "$old_pid" ]] \
+       && [[ "$(omarchy-shell shell ping 2>/dev/null)" == "ok" ]]; then
+      ready=1
+      break
+    fi
+    sleep 0.25
+  done
+
+  if (( ! ready )); then
+    printf 'dev-uninstall: shell did not come back within 30s.\n' >&2
+    printf 'Check: journalctl --user -e | grep -i qml\n' >&2
+    exit 1
+  fi
+
+  still="$(omarchy-shell shell listPlugins 2>/dev/null |
+    jq -r --arg id "$id" '.[] | select(.id == $id) | .id')"
+  if [[ -n $still ]]; then
+    printf 'dev-uninstall: %s is still discovered by the shell.\n' "$id" >&2
+    exit 1
+  fi
+  printf 'Shell reloaded; %s is gone.\n' "$id"
+else
+  printf 'Skipped the restart. Run omarchy-restart-shell to unload it.\n'
+fi
+
+# State the plugin owns outside its own directory is left alone on purpose:
+# a dev uninstall is not a user uninstall, and re-installing should not mean
+# re-pairing devices or re-entering credentials. The README's Uninstall
+# section covers removing those deliberately.
+printf 'Your checkout is untouched — run scripts/dev-install to put it back.\n'
