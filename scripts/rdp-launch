@@ -2,14 +2,17 @@
 # RDP Connections for Omarchy — launcher.
 # SPDX-License-Identifier: MIT
 #
-# Reads one connection's credentials from the Secret Service keyring and hands
-# them to sdl-freerdp3 over a pipe via /args-from:stdin, so nothing sensitive
-# reaches the world-readable /proc/<pid>/cmdline. See README.md.
+# Reads one connection from the index, its password from the Secret Service
+# keyring, and hands the lot to sdl-freerdp3 over a pipe via /args-from:stdin,
+# so nothing sensitive reaches the world-readable /proc/<pid>/cmdline.
+# See README.md.
 
 set -euo pipefail
 umask 077
 
-APP_ID="io.github.mdelgert.omarchy-rdp"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=rdp-common
+source "$SCRIPT_DIR/rdp-common"
 
 notify() {
   if command -v notify-send >/dev/null 2>&1; then
@@ -31,49 +34,58 @@ for dep in jq hyprctl secret-tool sdl-freerdp3; do
   command -v "$dep" >/dev/null 2>&1 || die "Missing dependency: $dep"
 done
 
-# ------------------------------------------------------------- credentials
+# ------------------------------------------------------------- connection
 
-secret_get() {
-  secret-tool lookup application "$APP_ID" connection "$id" field "$1" 2>/dev/null || true
-}
+[[ -r "$INDEX_FILE" ]] || die "No saved connections were found."
 
-server="$(secret_get server)"
-username="$(secret_get username)"
-password="$(secret_get password)"
+mapfile -t fields < <(jq -r --arg id "$id" \
+  '.connections[] | select(.id == $id) | .server // "", .username // ""' "$INDEX_FILE")
+server="${fields[0]-}"
+username="${fields[1]-}"
+mapfile -t monitors < <(jq -r --arg id "$id" \
+  '.connections[] | select(.id == $id) | (.monitors // [])[]' "$INDEX_FILE")
 
-# A locked or unavailable keyring reads as three empty values, so this covers
-# both "never finished saving" and "could not unlock". The message names
-# neither the host nor the account.
-if [[ -z "$server" || -z "$username" || -z "$password" ]]; then
-  die "Stored credentials are incomplete or the keyring is locked."
-fi
+[[ -n "$server" && -n "$username" ]] || die "That connection is incomplete — check it in Edit."
+
+password="$(secret-tool lookup application "$APP_ID" connection "$id" field password 2>/dev/null || true)"
+# A locked or unavailable keyring reads as an empty value, so this covers both
+# "never finished saving" and "could not unlock".
+[[ -n "$password" ]] || die "No stored password, or the keyring is locked."
 
 # /args-from: takes one argument per line, so an embedded newline would inject
-# an extra argument. rdp-menu strips them on entry; this is the backstop for
-# items written by other tools.
+# an extra argument. rdp-menu strips them on entry; this is the backstop for an
+# index that was hand-edited or written by another tool.
 for value in "$server" "$username" "$password"; do
   [[ "$value" != *$'\n'* ]] || die "Stored credentials contain a newline and cannot be used."
 done
 
 # ---------------------------------------------------------- hyprland socket
 
-# The bar's own environment can point at a stale compositor after a Hyprland
-# restart, so resolve the newest live instance instead of inheriting.
-mapfile -t hypr < <(hyprctl instances -j | jq -r 'sort_by(.time) | last | .instance, .wl_socket')
-signature="${hypr[0]-}"
-socket="${hypr[1]-}"
-if [[ -z "$signature" || -z "$socket" || "$signature" == "null" || "$socket" == "null" ]]; then
-  die "No running Hyprland instance was found."
-fi
-
-export HYPRLAND_INSTANCE_SIGNATURE="$signature"
-export WAYLAND_DISPLAY="$socket"
-
-# SDL FreeRDP needs this to place its fullscreen surfaces correctly under
-# wlroots-based compositors; without it /multimon lands on one output.
-export FREERDP_WLROOTS_HACK=force
+hypr_env || die "No running Hyprland instance was found."
 
 # ------------------------------------------------------------------- launch
+
+# No saved monitors means the whole desktop, which is what this plugin has
+# always done. A saved list is resolved from connector names to the ids
+# FreeRDP is using right now — see rdp-common for why the names are what get
+# stored. A display that is not currently attached is dropped rather than
+# allowed to shift every id after it onto the wrong screen.
+monitor_args=()
+if (( ${#monitors[@]} > 0 )); then
+  mapfile -t resolved < <(resolve_monitors "${monitors[@]}")
+  ids="${resolved[0]-}"
+  missing="${resolved[1]-}"
+  [[ -z "$missing" ]] || notify "Not attached right now: $missing"
+  if [[ -z "$ids" ]]; then
+    notify "None of this connection's monitors are attached — using all of them."
+  elif [[ "$ids" == *,* ]]; then
+    monitor_args=(/multimon "/monitors:$ids")
+  else
+    # One screen: /multimon would still span, so fullscreen alone targets it.
+    monitor_args=("/monitors:$ids")
+  fi
+fi
+(( ${#monitor_args[@]} > 0 )) || monitor_args=(/multimon)
 
 args=(
   "/v:$server"
@@ -86,7 +98,7 @@ args=(
   /cert:ignore
   /dvc:rdpecam
   +f
-  /multimon
+  "${monitor_args[@]}"
 )
 
 # printf is a shell builtin, so the credentials are written straight down the

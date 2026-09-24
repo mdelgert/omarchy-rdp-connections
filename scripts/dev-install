@@ -151,8 +151,8 @@ if (( restart )); then
 
   case "$enabled" in
     true)  printf 'Shell reloaded; %s is enabled.\n' "$id" ;;
-    false) printf 'Shell reloaded; %s is installed but disabled.\n' "$id"
-           printf 'Enable it with: omarchy plugin enable %s --section right\n' "$id" ;;
+    false) omarchy plugin enable io.github.mdelgert.rdp-connections --section right
+           printf 'Shell reloaded; %s was disabled and has now been enabled.\n' "$id" ;;
   esac
 else
   printf 'Skipped the restart. Run omarchy-restart-shell to see the changes.\n'

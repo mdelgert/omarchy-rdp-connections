@@ -6,6 +6,10 @@ RDP Connections is an Omarchy Quattro bar widget for creating, editing, removing
 
 Enable the plugin in Omarchy. Select **RDP** from the bar, then choose **Connect**, **New connection**, **Edit connection**, or **Remove connection**. The connection flow asks only for a server, user name, and password.
 
+**Edit connection** additionally offers a display **Name** and a **Monitors** choice. A new connection spans every monitor, which is the previous behavior. To narrow it, pick the screens one at a time — each pick appends to the list, and **Save this order** stores it. The order matters: FreeRDP treats the first screen in the list as the session's primary, so `DP-9` then `DP-11` is a different desktop from `DP-11` then `DP-9`. **All monitors** restores the default and **Start over** clears the current selection.
+
+Monitors are stored by connector name (`DP-11`), not by the numeric id that `sdl-freerdp3 /list:monitor` prints. Those ids are SDL display indices and shift whenever a display is plugged, unplugged, or redocked; the name is resolved to whatever id is correct at connect time. A saved screen that is not attached is skipped with a notification, and a connection whose screens are all absent falls back to spanning everything.
+
 ## Screenshots
 
 The RDP entry appears in the right side of the Omarchy bar.
@@ -54,13 +58,17 @@ https://github.com/mdelgert/omarchy-rdp-connections
 
 ## Data handling
 
-Connection server, user name, and password are stored in the user's Secret Service keyring. The plugin's local state contains only a connection label and an opaque identifier. It does not edit Hyprland, Omarchy, shell, or bar configuration files.
+The connection password is stored in the user's Secret Service keyring. The server, user name, display name, and monitor choice are stored as configuration in `$XDG_STATE_HOME/omarchy-rdp-connections/connections.json`, an owner-only file in an owner-only directory, keyed by the same opaque identifier used for the keyring entry.
 
-The RDP client is configured for the working multi-monitor connection profile, including fullscreen, audio, microphone, clipboard, camera, keyboard capture, and certificate-ignore behavior. Certificate-ignore behavior bypasses server-certificate validation; connect only to hosts you trust.
+That line is drawn deliberately. While a session is unlocked, the Secret Service is readable over D-Bus by any process running as the user, which is the same exposure as an owner-only file — so the keyring only earns its cost for the one value whose disclosure at rest cannot be undone. This is the split Remmina, `mstsc`, and `ssh_config` all make: identity and configuration in config, authentication material in the keyring. A consequence worth having is that the connection list still renders, and can still be edited or removed, while the keyring is locked; only connecting needs an unlock.
+
+Installations created by an earlier version, which kept the server and user name in the keyring, are upgraded in place the first time the menu is opened with the keyring unlocked. The old keyring fields are cleared only after the values have been read back out of the index. The plugin does not edit Hyprland, Omarchy, shell, or bar configuration files.
+
+The RDP client is configured for the working multi-monitor connection profile, including fullscreen, the selected monitors, audio, microphone, clipboard, camera, keyboard capture, and certificate-ignore behavior. Certificate-ignore behavior bypasses server-certificate validation; connect only to hosts you trust.
 
 ## Removal
 
-Remove every saved connection from the RDP menu first if its keyring entries should also be deleted. Then remove **RDP Connections** through Omarchy's plugin manager.
+Remove every saved connection from the RDP menu first if its keyring entry and its stored configuration should also be deleted. Then remove **RDP Connections** through Omarchy's plugin manager.
 
 ## License
 

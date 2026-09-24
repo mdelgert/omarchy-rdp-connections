@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# RDP Connections for Omarchy — helpers shared by rdp-menu and rdp-launch.
+# SPDX-License-Identifier: MIT
+#
+# Sourced, never executed. Holds the three things both scripts need to agree
+# on: where the connection index lives, how to find the live Hyprland session,
+# and how to turn a stored monitor name into the id FreeRDP wants today.
+#
+# Storage split: the keyring holds the password and nothing else. Server,
+# username, label and monitor choice are ordinary configuration and live in
+# the index file. An unlocked Secret Service keyring is readable over D-Bus by
+# any process running as this user, exactly like a 0600 file in a 0700
+# directory is — so the keyring only earns its cost for the one value whose
+# disclosure at rest is unrecoverable. This is the same split Remmina, mstsc
+# and ssh_config make.
+
+APP_ID="io.github.mdelgert.omarchy-rdp"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections"
+INDEX_FILE="$STATE_DIR/connections.json"
+
+# ------------------------------------------------------------------ hyprland
+
+# Point this process at the newest live Hyprland instance. The bar's own
+# environment can name a compositor that has since been restarted, so the
+# socket is resolved rather than inherited. Returns non-zero if none is up.
+hypr_env() {
+  local -a hypr
+  mapfile -t hypr < <(hyprctl instances -j 2>/dev/null |
+    jq -r 'sort_by(.time) | last | .instance, .wl_socket' 2>/dev/null)
+  local signature="${hypr[0]-}" socket="${hypr[1]-}"
+  [[ -n "$signature" && -n "$socket" && "$signature" != null && "$socket" != null ]] || return 1
+  export HYPRLAND_INSTANCE_SIGNATURE="$signature"
+  export WAYLAND_DISPLAY="$socket"
+  # SDL FreeRDP needs this to place its fullscreen surfaces correctly under
+  # wlroots-based compositors; without it /multimon lands on one output.
+  export FREERDP_WLROOTS_HACK=force
+}
+
+# ------------------------------------------------------------------ monitors
+
+# FreeRDP's own view of the outputs, one per line as
+#   <id>\t<connector>\t<WxH>\t<+x+y>\t<0|1 primary>
+# parsed from `/list:monitor`, whose rows look like
+#   * [3] [Dell Inc. DELL U3824DW 1N337B4 (DP-11)] 3840x1600<TAB>+2560+0
+#
+# The ids are SDL display indices and move whenever a display is plugged,
+# unplugged or redocked — which is exactly why a connection stores the
+# connector name instead and resolves it here at launch time.
+#
+# Timed out rather than trusted: this runs on the path that opens the menu,
+# and a wedged client must not hang the bar.
+monitor_rows() {
+  timeout 10 sdl-freerdp3 /list:monitor 2>/dev/null |
+    sed -nE 's/^[[:space:]]*(\*?)[[:space:]]*\[([0-9]+)\][[:space:]]+\[.*\(([^()]+)\)\][[:space:]]+([0-9]+x[0-9]+)[[:space:]]+([+-][0-9]+[+-][0-9]+).*$/\2\t\3\t\4\t\5\t\1/p' |
+    sed -E 's/\*$/1/; s/\t$/\t0/'
+}
+
+# Map stored connector names to today's ids, preserving the caller's order —
+# the order is the point, since FreeRDP treats the first id in /monitors: as
+# the primary screen of the session.
+#
+# Usage: resolve_monitors DP-11 DP-9
+# Prints two lines: the comma-separated ids that resolved, then the names that
+# did not, space separated. Either line may be empty, so a caller can tell
+# "nothing attached" from "some of it moved" and decide what to do.
+resolve_monitors() {
+  local -a rows=() ids=() missing=()
+  local name row id connector
+  mapfile -t rows < <(monitor_rows)
+  for name in "$@"; do
+    id=""
+    for row in ${rows[@]+"${rows[@]}"}; do
+      IFS=$'\t' read -r id connector _ _ _ <<<"$row"
+      [[ "$connector" == "$name" ]] && break
+      id=""
+    done
+    if [[ -n "$id" ]]; then ids+=("$id"); else missing+=("$name"); fi
+  done
+  (IFS=,; printf '%s\n' "${ids[*]-}")
+  printf '%s\n' "${missing[*]-}"
+}

@@ -8,27 +8,27 @@
 # the bar widget collects it in a QML password field and passes it down this
 # script's stdin. See README.md.
 #
-# Security model: server, username and password live only in the Secret
-# Service keyring. The JSON index on disk holds nothing but opaque ids — a
-# connection is labelled by its server, and that label is read back out of the
-# keyring at display time rather than cached on disk. No secret is ever passed
-# as a command-line argument, written to a temp file, echoed to a log, or
-# included in a notification.
+# Security model: the password lives in the Secret Service keyring and nothing
+# else does. Server, username, label and monitor choice are configuration, not
+# authentication material, and live in the JSON index alongside the connection
+# id — see the note in rdp-common for why that line is drawn there. The index
+# is owner-only, in an owner-only directory. No password is ever passed as a
+# command-line argument, written to a temp file, echoed to a log, or included
+# in a notification.
 
 set -euo pipefail
 umask 077
 
-APP_ID="io.github.mdelgert.omarchy-rdp"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rdp-connections"
-INDEX_FILE="$STATE_DIR/connections.json"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=rdp-common
+source "$SCRIPT_DIR/rdp-common"
 
 # Glyphs are taken from the set Omarchy's own menu already renders, so they
 # resolve in whatever Nerd Font the menu is configured with. Written as escapes
 # rather than literal characters so they survive copying and editing intact.
 GLYPH_CONNECT=$'\U000F14DE'  # trigger
 GLYPH_NEW=$'\U000F0249'      # install
-GLYPH_EDIT=$'\uE615'         # setup
+GLYPH_EDIT=$''         # setup
 GLYPH_REMOVE=$'\U000F0B4C'   # remove
 GLYPH_HOST=$'\U000F0379'     # monitor
 
@@ -60,7 +60,7 @@ die() {
   exit 1
 }
 
-for dep in jq flock secret-tool omarchy-menu-select omarchy-menu-input; do
+for dep in jq flock secret-tool hyprctl sdl-freerdp3 omarchy-menu-select omarchy-menu-input; do
   command -v "$dep" >/dev/null 2>&1 || die "Missing dependency: $dep"
 done
 
@@ -80,7 +80,7 @@ if ! flock -n 9; then
   exit 0
 fi
 
-[[ -e "$INDEX_FILE" ]] || printf '%s\n' '{"connections":[]}' >"$INDEX_FILE"
+[[ -e "$INDEX_FILE" ]] || printf '%s\n' '{"version":2,"connections":[]}' >"$INDEX_FILE"
 jq -e 'has("connections") and (.connections | type == "array")' "$INDEX_FILE" >/dev/null 2>&1 \
   || die "Connection index is unreadable: $INDEX_FILE"
 
@@ -119,41 +119,26 @@ new_id() {
   printf 'conn-%s' "$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 }
 
-# A connection is identified in the UI by its server. Two connections may
-# legitimately point at the same host, so a repeat gets a counter appended for
-# display only — enough to tell the rows apart and to map a choice back to one
-# id, without inventing a second name the user has to maintain.
-#
-# Fills the caller's LABELS and IDS arrays, in index order.
-build_labels() {
-  local id server label
-  declare -A seen=()
-  LABELS=()
-  IDS=()
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    server="$(secret_get "$id" server)"
-    [[ -n "$server" ]] || server="(unavailable — keyring locked?)"
-    if [[ -n "${seen[$server]:-}" ]]; then
-      seen["$server"]=$(( seen["$server"] + 1 ))
-      label="$server (${seen[$server]})"
-    else
-      seen["$server"]=1
-      label="$server"
-    fi
-    LABELS+=("$label")
-    IDS+=("$id")
-  done < <(jq -r '.connections[].id' "$INDEX_FILE")
+conn_get() {
+  jq -r --arg id "$1" --arg f "$2" \
+    '.connections[] | select(.id == $id) | .[$f] // "" | tostring' "$INDEX_FILE"
 }
 
-label_for_id() {
-  local id="$1" i
-  local -a LABELS=() IDS=()
-  build_labels
-  for i in "${!IDS[@]}"; do
-    [[ "${IDS[$i]}" == "$id" ]] && { printf '%s' "${LABELS[$i]}"; return 0; }
-  done
-  printf '%s' "a connection"
+conn_monitors() {
+  jq -r --arg id "$1" \
+    '.connections[] | select(.id == $id) | (.monitors // [])[]' "$INDEX_FILE"
+}
+
+# Set one string field on one connection.
+conn_set() {
+  jq --arg id "$1" --arg f "$2" --arg v "$3" \
+    '.connections |= map(if .id == $id then .[$f] = $v else . end)' "$INDEX_FILE" | write_index
+}
+
+# Set the monitor list, which arrives as a JSON array rather than a string.
+conn_set_monitors() {
+  jq --arg id "$1" --argjson m "$2" \
+    '.connections |= map(if .id == $id then .monitors = $m else . end)' "$INDEX_FILE" | write_index
 }
 
 # ------------------------------------------------------------------ secrets
@@ -175,6 +160,8 @@ secret_set() {
   [[ "$(secret_get "$id" "$field")" == "$value" ]]
 }
 
+# server and username are cleared too, so upgrading a v1 install actually
+# removes them from the keyring rather than leaving them behind unreferenced.
 secret_forget() {
   local id="$1" field
   for field in server username password; do
@@ -182,7 +169,81 @@ secret_forget() {
   done
 }
 
+# ------------------------------------------------------------------ migrate
+
+# v1 kept server and username in the keyring. Move them into the index and
+# clear them, once, on the first run that sees a v1 entry.
+#
+# A locked keyring reads as empty, and treating that as "no server" would
+# quietly replace a real host with a blank one, so the whole migration backs
+# out instead. Clearing only happens after the new value has been read back
+# out of the index, so a crash mid-way leaves the data in one place or both,
+# never neither.
+migrate_index() {
+  local -a legacy=()
+  mapfile -t legacy < <(jq -r '.connections[] | select(has("server") | not) | .id' "$INDEX_FILE")
+  (( ${#legacy[@]} > 0 )) || return 0
+
+  local id server username
+  for id in "${legacy[@]}"; do
+    server="$(secret_get "$id" server)"
+    if [[ -z "$server" ]]; then
+      notify "Unlock the keyring to finish upgrading saved connections. Nothing was changed."
+      return 0
+    fi
+    username="$(secret_get "$id" username)"
+    jq --arg id "$id" --arg server "$server" --arg username "$username" \
+      '.connections |= map(if .id == $id
+                           then . + {name: (.name // ""), server: $server,
+                                     username: $username, monitors: (.monitors // [])}
+                           else . end)' "$INDEX_FILE" | write_index
+    [[ "$(conn_get "$id" server)" == "$server" ]] || die "Could not upgrade the connection index."
+    secret-tool clear application "$APP_ID" connection "$id" field server 2>/dev/null || true
+    secret-tool clear application "$APP_ID" connection "$id" field username 2>/dev/null || true
+  done
+  jq '.version = 2' "$INDEX_FILE" | write_index
+  notify "Saved connections upgraded; only passwords remain in the keyring."
+}
+
+migrate_index
+
 # ----------------------------------------------------------------------- ui
+
+# A connection is identified in the UI by its name, or by its server when it
+# has none. Two connections may legitimately share a label, so a repeat gets a
+# counter appended for display only — enough to tell the rows apart and to map
+# a choice back to one id, without inventing a second name the user has to
+# maintain.
+#
+# Fills the caller's LABELS and IDS arrays, in index order.
+build_labels() {
+  local id label
+  declare -A seen=()
+  LABELS=()
+  IDS=()
+  while IFS=$'\t' read -r id label; do
+    [[ -n "$id" ]] || continue
+    [[ -n "$label" ]] || label="(unnamed)"
+    if [[ -n "${seen[$label]:-}" ]]; then
+      seen["$label"]=$(( seen["$label"] + 1 ))
+      label="$label (${seen[$label]})"
+    else
+      seen["$label"]=1
+    fi
+    LABELS+=("$label")
+    IDS+=("$id")
+  done < <(jq -r '.connections[] | [.id, (if (.name // "") != "" then .name else (.server // "") end)] | @tsv' "$INDEX_FILE")
+}
+
+label_for_id() {
+  local id="$1" i
+  local -a LABELS=() IDS=()
+  build_labels
+  for i in "${!IDS[@]}"; do
+    [[ "${IDS[$i]}" == "$id" ]] && { printf '%s' "${LABELS[$i]}"; return 0; }
+  done
+  printf '%s' "a connection"
+}
 
 # Both helpers exit non-zero when the user presses Escape, and
 # omarchy-menu-input also exits non-zero on an empty answer, so a caller only
@@ -249,6 +310,82 @@ choose_id() {
   return 1
 }
 
+# ------------------------------------------------------------------ monitors
+
+# Reads the caller's MONITORS array and renders it the way the prompt and the
+# notifications want to say it.
+monitors_summary() {
+  if (( $# == 0 )); then printf 'all monitors'; else (IFS=', '; printf '%s' "$*"); fi
+}
+
+# Build an ordered monitor selection one pick at a time. Order is the whole
+# point of the feature: FreeRDP takes the first id in /monitors: as the
+# session's primary screen, so "DP-9 then DP-11" is a different desktop from
+# "DP-11 then DP-9".
+#
+# Picks are stored as connector names, not the ids FreeRDP prints. Those ids
+# are SDL display indices that shift when a display is plugged, unplugged or
+# redocked, so a saved "3" silently becomes the wrong screen; rdp-launch
+# resolves the names to whatever the ids are at connect time.
+#
+# An option carries its geometry as menu subtext, which comes back appended
+# after a tab — so the connector name is always the field before the first
+# tab, and the plain action rows below return their label alone.
+edit_monitors() {
+  local id="$1"
+  local -a rows=() chosen=() options=()
+  local row mid connector geom primary detail answer choice c already
+
+  hypr_env || { notify "No running Hyprland instance was found."; return 0; }
+  mapfile -t rows < <(monitor_rows)
+  (( ${#rows[@]} > 0 )) || {
+    notify "No monitors were detected — leaving this connection on all monitors."
+    return 0
+  }
+
+  mapfile -t chosen < <(conn_monitors "$id")
+
+  while true; do
+    options=("$GLYPH_HOST"$'\t'"All monitors")
+    for row in "${rows[@]}"; do
+      IFS=$'\t' read -r mid connector geom _ primary <<<"$row"
+      already=0
+      for c in ${chosen[@]+"${chosen[@]}"}; do
+        [[ "$c" == "$connector" ]] && already=1
+      done
+      (( already )) && continue
+      detail="$geom"
+      (( primary )) && detail="$geom · primary"
+      options+=("$GLYPH_HOST"$'\t'"$connector"$'\t'"$detail")
+    done
+    if (( ${#chosen[@]} > 0 )); then
+      options+=("$GLYPH_CONNECT"$'\t'"Save this order")
+      options+=("$GLYPH_REMOVE"$'\t'"Start over")
+    fi
+
+    answer="$(pick "Monitors: $(monitors_summary ${chosen[@]+"${chosen[@]}"})" "${options[@]}")" || return 0
+    choice="${answer%%$'\t'*}"
+    case "$choice" in
+      'All monitors')
+        conn_set_monitors "$id" '[]'
+        notify "Monitors set to all."
+        return 0
+        ;;
+      'Save this order')
+        conn_set_monitors "$id" "$(printf '%s\n' "${chosen[@]}" | jq -R . | jq -sc .)"
+        notify "Monitors set to $(monitors_summary "${chosen[@]}")."
+        return 0
+        ;;
+      'Start over')
+        chosen=()
+        ;;
+      *)
+        chosen+=("$choice")
+        ;;
+    esac
+  done
+}
+
 # ------------------------------------------------------------------ actions
 
 # Every prompt is read into `raw` first: the helpers exit non-zero when the
@@ -273,18 +410,19 @@ new_connection() {
   SECRET_REPLY=""
   [[ -n "$password" ]] || { notify "Password is required — nothing saved."; return 0; }
 
+  # Keyring first: a failure there must not leave an index entry that cannot
+  # log in. A new connection spans every monitor, as it always has; the
+  # monitor picker lives in Edit so the create flow stays three prompts long.
   id="$(new_id)"
-  secret_set "$id" "$server" server "$server" || die "Could not write to the keyring."
-  secret_set "$id" "$server" username "$username" || die "Could not write to the keyring."
   secret_set "$id" "$server" password "$password" || die "Could not write to the keyring."
-  jq --arg id "$id" '.connections += [{id: $id}]' "$INDEX_FILE" | write_index
+  jq --arg id "$id" --arg server "$server" --arg username "$username" \
+    '.connections += [{id: $id, name: "", server: $server, username: $username, monitors: []}]' \
+    "$INDEX_FILE" | write_index
   notify "Connection saved."
 }
 
-# One field at a time. omarchy-menu-input cannot prefill, and putting the
-# current host or username into a prompt would publish it in the helper's
-# world-readable /proc/<pid>/cmdline, so the menu asks what to change instead
-# of walking every field on every edit.
+# One field at a time. omarchy-menu-input cannot prefill, so the menu asks what
+# to change rather than walking every field on every edit.
 edit_connection() {
   local id label field raw value
   id="$(choose_id 'Edit')" || return 0
@@ -292,24 +430,30 @@ edit_connection() {
   while true; do
     label="$(label_for_id "$id")"
     field="$(pick "Edit $label" \
+      "$GLYPH_EDIT	Name" \
       "$GLYPH_HOST	Server" \
       "$GLYPH_EDIT	Username" \
-      "$GLYPH_EDIT	Password")" || return 0
+      "$GLYPH_EDIT	Password" \
+      "$GLYPH_HOST	Monitors")" || return 0
 
     case "$field" in
+      Name)
+        raw="$(ask 'Display name (blank to use the server)')" || continue
+        conn_set "$id" name "$(sanitize "$raw")"
+        notify "Name updated."
+        ;;
       Server)
         raw="$(ask 'New server (host or host:port)')" || continue
         value="$(sanitize "$raw")"
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$value" server "$value" || die "Could not write to the keyring."
+        conn_set "$id" server "$value"
         notify "Server updated."
         ;;
       Username)
         raw="$(ask 'New username (user or DOMAIN\user)')" || continue
         value="$(sanitize "$raw")"
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$(secret_get "$id" server)" username "$value" \
-          || die "Could not write to the keyring."
+        conn_set "$id" username "$value"
         notify "Username updated."
         ;;
       Password)
@@ -317,9 +461,12 @@ edit_connection() {
         value="$(sanitize "$SECRET_REPLY")"
         SECRET_REPLY=""
         [[ -n "$value" ]] || continue
-        secret_set "$id" "$(secret_get "$id" server)" password "$value" \
+        secret_set "$id" "$(conn_get "$id" server)" password "$value" \
           || die "Could not write to the keyring."
         notify "Password updated."
+        ;;
+      Monitors)
+        edit_monitors "$id"
         ;;
       *) return 0 ;;
     esac
