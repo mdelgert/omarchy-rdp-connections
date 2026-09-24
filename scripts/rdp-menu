@@ -386,6 +386,36 @@ edit_monitors() {
   done
 }
 
+# ------------------------------------------------------------------- network
+
+# FreeRDP auto-detects the link by default and adapts to it, which is the right
+# answer for a connection that travels. Pinning a type turns the probing off
+# and fixes the performance profile instead: worth it on a LAN, actively worse
+# on anything whose bandwidth moves. Stored as the token FreeRDP expects, with
+# "" meaning auto so an index written before this existed keeps working.
+edit_network() {
+  local id="$1" current answer choice value
+  current="$(conn_get "$id" network)"
+  [[ -n "$current" ]] || current="auto"
+  answer="$(pick "Network (now: $current)" \
+    "$GLYPH_EDIT"$'\t'"Auto"$'\t'"measure the link (default)" \
+    "$GLYPH_EDIT"$'\t'"LAN"$'\t'"all effects, no probing" \
+    "$GLYPH_EDIT"$'\t'"Broadband" \
+    "$GLYPH_EDIT"$'\t'"WAN" \
+    "$GLYPH_EDIT"$'\t'"Modem")" || return 0
+  choice="${answer%%$'\t'*}"
+  case "$choice" in
+    Auto) value="" ;;
+    LAN) value="lan" ;;
+    Broadband) value="broadband" ;;
+    WAN) value="wan" ;;
+    Modem) value="modem" ;;
+    *) return 0 ;;
+  esac
+  conn_set "$id" network "$value"
+  notify "Network set to $choice."
+}
+
 # ------------------------------------------------------------------ actions
 
 # Every prompt is read into `raw` first: the helpers exit non-zero when the
@@ -416,7 +446,8 @@ new_connection() {
   id="$(new_id)"
   secret_set "$id" "$server" password "$password" || die "Could not write to the keyring."
   jq --arg id "$id" --arg server "$server" --arg username "$username" \
-    '.connections += [{id: $id, name: "", server: $server, username: $username, monitors: []}]' \
+    '.connections += [{id: $id, name: "", server: $server, username: $username,
+                       monitors: [], network: ""}]' \
     "$INDEX_FILE" | write_index
   notify "Connection saved."
 }
@@ -434,7 +465,8 @@ edit_connection() {
       "$GLYPH_HOST	Server" \
       "$GLYPH_EDIT	Username" \
       "$GLYPH_EDIT	Password" \
-      "$GLYPH_HOST	Monitors")" || return 0
+      "$GLYPH_HOST	Monitors" \
+      "$GLYPH_EDIT	Network")" || return 0
 
     case "$field" in
       Name)
@@ -467,6 +499,9 @@ edit_connection() {
         ;;
       Monitors)
         edit_monitors "$id"
+        ;;
+      Network)
+        edit_network "$id"
         ;;
       *) return 0 ;;
     esac

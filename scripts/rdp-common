@@ -38,6 +38,21 @@ hypr_env() {
 
 # ------------------------------------------------------------------ monitors
 
+# The Hyprland scale of one output, as an integer percentage.
+#
+# Takes a connector name and falls back to the focused output when the name is
+# empty or that display is not attached right now, so a connection saved on a
+# laptop panel still scales sensibly when it is opened on a dock. Prints 100
+# when Hyprland cannot be asked at all, which is the same as no scaling.
+monitor_scale_percent() {
+  local connector="${1-}" scale
+  scale="$(hyprctl monitors -j 2>/dev/null |
+    jq -r --arg n "$connector" \
+      '(map(select(.name == $n)) + map(select(.focused)) + .)[0].scale // empty' 2>/dev/null)"
+  [[ -n "$scale" ]] || scale=1
+  awk -v s="$scale" 'BEGIN { printf "%d", (s * 100) + 0.5 }'
+}
+
 # FreeRDP's own view of the outputs, one per line as
 #   <id>\t<connector>\t<WxH>\t<+x+y>\t<0|1 primary>
 # parsed from `/list:monitor`, whose rows look like

@@ -39,9 +39,10 @@ done
 [[ -r "$INDEX_FILE" ]] || die "No saved connections were found."
 
 mapfile -t fields < <(jq -r --arg id "$id" \
-  '.connections[] | select(.id == $id) | .server // "", .username // ""' "$INDEX_FILE")
+  '.connections[] | select(.id == $id) | .server // "", .username // "", .network // ""' "$INDEX_FILE")
 server="${fields[0]-}"
 username="${fields[1]-}"
+network="${fields[2]-}"
 mapfile -t monitors < <(jq -r --arg id "$id" \
   '.connections[] | select(.id == $id) | (.monitors // [])[]' "$INDEX_FILE")
 
@@ -87,19 +88,64 @@ if (( ${#monitors[@]} > 0 )); then
 fi
 (( ${#monitor_args[@]} > 0 )) || monitor_args=(/multimon)
 
+# -------------------------------------------------------------------- scaling
+#
+# FreeRDP draws the guest at the pixel size of the surface, so on a scaled
+# display Windows lands at a fraction of the size everything else on the screen
+# is. /scale only takes RDP's own DesktopScaleFactor steps — 100, 140 or 180 —
+# so the monitor's Hyprland scale is snapped to the nearest one, the same
+# mapping omarchy-windows-vm uses. The screen that decides it is the session's
+# primary: the first saved monitor, or the focused one when the connection
+# spans everything.
+scale_args=()
+scale_percent="$(monitor_scale_percent "${monitors[0]-}")"
+if (( scale_percent >= 170 )); then
+  scale_args=(/scale:180)
+elif (( scale_percent >= 130 )); then
+  scale_args=(/scale:140)
+fi
+
+# -------------------------------------------------------------------- network
+#
+# Nothing stored means FreeRDP's own default, ConnectionType 7 (auto-detect):
+# it measures the link during the handshake and adapts as it goes. A stored
+# value pins the profile and turns the probing off instead — `lan` keeps every
+# desktop effect enabled and never backs off, which is right for a host on this
+# desk and wrong over a VPN. An unrecognised value is dropped rather than
+# passed through, since FreeRDP aborts on an invalid /network:.
+network_args=()
+case "$network" in
+  '' | auto) ;;
+  modem | broadband | broadband-low | broadband-high | wan | lan)
+    network_args=("/network:$network")
+    ;;
+  *) notify "Ignoring unknown network type: $network" ;;
+esac
+
+# There is deliberately no -grab-keyboard here. FreeRDP grabs the keyboard by
+# default (GrabKeyboard is TRUE in `sdl-freerdp3 /list:tune`), and that grab is
+# what sends SUPER and the rest to Windows. Disabling it leaves every Hyprland
+# binding live over the session, so a keystroke meant for the guest can open
+# the bar's Bluetooth panel or switch workspace instead. The SDL client
+# implements the grab with the Wayland keyboard-shortcuts-inhibit protocol,
+# which Hyprland honours; it lifts as soon as the window loses focus, and
+# FreeRDP's own Ctrl+Alt+Enter still toggles fullscreen from inside the session.
 args=(
   "/v:$server"
   "/u:$username"
   "/p:$password"
-  -grab-keyboard
   /sound
   /microphone
   /clipboard
   /cert:ignore
   /dvc:rdpecam
-  /network:lan 
   /gfx:AVC444:on
+  # Without this the guest desktop is scaled or cropped the moment the window
+  # stops being exactly the size it was at connect time.
+  +dynamic-resolution
   +f
+  ${network_args[@]+"${network_args[@]}"}
+  ${scale_args[@]+"${scale_args[@]}"}
   "${monitor_args[@]}"
 )
 
