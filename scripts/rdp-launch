@@ -97,6 +97,8 @@ args=(
   /clipboard
   /cert:ignore
   /dvc:rdpecam
+  /network:lan 
+  /gfx:AVC444:on
   +f
   "${monitor_args[@]}"
 )
